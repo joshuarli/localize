@@ -3,6 +3,7 @@ mod cli;
 mod downloader;
 mod rewriter;
 mod scanner;
+mod towebp;
 mod zap;
 
 fn main() {

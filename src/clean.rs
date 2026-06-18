@@ -33,9 +33,12 @@ pub struct BrokenLink {
     pub url: String,
     pub tag: String,
     pub attr: String,
+    #[allow(dead_code)]
     pub url_span: Range<usize>,
     pub tag_span: Range<usize>,
+    #[allow(dead_code)]
     pub line: usize,
+    #[allow(dead_code)]
     pub action: &'static str,
 }
 
@@ -172,8 +175,8 @@ fn resolve_href<'a>(
         scratch.push_str(path);
         return scratch;
     }
-    if path.starts_with('/') {
-        scratch.push_str(&path[1..]);
+    if let Some(stripped) = path.strip_prefix('/') {
+        scratch.push_str(stripped);
         return scratch;
     }
 
@@ -404,6 +407,7 @@ fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
 #[derive(Debug)]
 pub struct RemovalOp {
     pub span: Range<usize>,
+    #[allow(dead_code)]
     pub description: String,
 }
 

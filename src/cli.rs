@@ -66,7 +66,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (scan, apply, clean, or zap)".into());
+                return Err("expected subcommand (scan, apply, clean, zap, or towebp)".into());
             }
         }
     }
@@ -95,10 +95,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             // Root is optional — caught as a Value in the flag loop, or defaults to ".".
         }
         _ => {
-            // Root (optional, defaults to ".")
-            if let Some(Value(val)) = parser.next()? {
-                args.root = Some(val.string()?);
-            }
+            // Root is optional — caught as a Value in the flag loop below, or defaults to ".".
         }
     }
 
@@ -860,6 +857,143 @@ fn cmd_zap(args: Args) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_towebp(args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+    let apply = args.apply;
+    let verbose = args.verbose;
+
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+    let jobs = if args.jobs == 0 {
+        num_cpus() * 4
+    } else {
+        args.jobs
+    };
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = iter_html_files(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to scan", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    if apply {
+        eprintln!(
+            "Converting jpg/jpeg/png → webp in {} file(s) with {jobs} workers...",
+            files.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: scanning {} file(s) for jpg/jpeg/png URLs with {jobs} workers...",
+            files.len()
+        );
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
+    let root_path = std::path::Path::new(root);
+
+    let (total_matches, mut file_results, errors) = rt.block_on(async {
+        let sem = Arc::new(Semaphore::new(jobs));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let file_total = files.len();
+
+        let mut handles = Vec::with_capacity(files.len());
+        for rel in &files {
+            let rel = rel.clone();
+            let sem = sem.clone();
+            let counter = counter.clone();
+            let root_path = root_path.to_path_buf();
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                tokio::task::spawn_blocking(move || {
+                    let path = root_path.join(&rel);
+                    let result = crate::towebp::towebp_file(&path, !apply);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose {
+                        eprint!("\rScanning: {done}/{file_total} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                    (rel.clone(), result)
+                })
+                .await
+                .unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let mut total_matches = 0usize;
+        let mut errors = Vec::new();
+        let mut file_results: Vec<(String, Vec<crate::towebp::WebpMatch>)> = Vec::new();
+
+        for handle in handles {
+            match handle.await {
+                Ok((rel, Ok(matches))) => {
+                    if !matches.is_empty() {
+                        total_matches += matches.len();
+                        file_results.push((rel, matches));
+                    }
+                }
+                Ok((rel, Err(e))) => {
+                    errors.push((rel, e));
+                }
+                Err(e) => {
+                    errors.push((String::new(), format!("join error: {e}")));
+                }
+            }
+        }
+
+        (total_matches, file_results, errors)
+    });
+
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+
+    if !errors.is_empty() {
+        eprintln!("Errors:");
+        for (rel, err) in &errors {
+            if rel.is_empty() {
+                eprintln!("  {err}");
+            } else {
+                eprintln!("  {rel}: {err}");
+            }
+        }
+    }
+
+    file_results.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, matches) in &file_results {
+        println!("./{rel}");
+        for m in matches {
+            println!("  {} {}: {} → {}", m.tag, m.attr, m.url, m.new_url);
+        }
+        println!();
+    }
+
+    if apply {
+        eprintln!(
+            "Converted {} URL(s) in {} file(s).",
+            total_matches,
+            file_results.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: found {} URL(s) to convert in {} file(s). Run with --apply to rewrite.",
+            total_matches,
+            file_results.len()
+        );
+    }
+
+    Ok(())
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -871,7 +1005,7 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <scan|apply|clean|zap> [ROOT] [flags]");
+            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
             return 1;
         }
     };
@@ -881,14 +1015,15 @@ pub fn run() -> i32 {
         Some("apply") => cmd_apply(args),
         Some("clean") => cmd_clean(args),
         Some("zap") => cmd_zap(args),
+        Some("towebp") => cmd_towebp(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <scan|apply|clean|zap> [ROOT] [flags]");
+            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (scan, apply, clean, or zap)");
-            eprintln!("Usage: localize <scan|apply|clean|zap> [ROOT] [flags]");
+            eprintln!("localize: expected subcommand (scan, apply, clean, zap, or towebp)");
+            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
             return 1;
         }
     };
