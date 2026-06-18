@@ -1,0 +1,57 @@
+[package]
+name = "localize"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+html5gum = "0.8"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-roots", "http1", "ring", "native-tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+bytes = "1"
+ring = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "time"] }
+lexopt = "0.3"
+url = "2"
+glob = "0.3"
+walkdir = "2"
+regex-lite = "0.1"
+rustc-hash = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+panic = "abort"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[lints.clippy]
+nursery = { level = "allow", priority = -2 }
+pedantic = { level = "allow", priority = -2 }
+complexity = { level = "deny", priority = -2 }
+correctness = { level = "deny", priority = -2 }
+perf = { level = "deny", priority = -2 }
+restriction = { level = "allow", priority = -2 }
+suspicious = { level = "deny", priority = -2 }
+cargo = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+blanket_clippy_restriction_lints = { level = "allow", priority = 0 }
+wildcard_imports = { level = "deny", priority = 0 }
+disallowed_types = { level = "deny", priority = 1 }
+single_call_fn = { level = "allow", priority = 1 }
+multiple_crate_versions = { level = "allow", priority = 1 }
+result_large_err = { level = "allow", priority = 1 }
