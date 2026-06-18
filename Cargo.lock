@@ -74,29 +74,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "localize"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "glob",
- "html5gum",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "lexopt",
- "regex-lite",
- "ring",
- "rustc-hash",
- "rustls",
- "tempfile",
- "tokio",
- "url",
- "walkdir",
- "webpki-roots",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -420,6 +397,29 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "localize"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "glob",
+ "html5gum",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "lexopt",
+ "regex-lite",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "tempfile",
+ "tokio",
+ "url",
+ "walkdir",
+ "webpki-roots",
+]
 
 [[package]]
 name = "mio"

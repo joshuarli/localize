@@ -1,3 +1,4 @@
+mod clean;
 mod cli;
 mod downloader;
 mod rewriter;

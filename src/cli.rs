@@ -529,6 +529,144 @@ fn verify_no_remote(files: &[String], root: &str) -> Vec<String> {
     stray
 }
 
+fn cmd_clean(args: Args) -> Result<(), String> {
+    let root = args.root.as_ref().ok_or("missing root")?;
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+    let jobs = if args.jobs == 0 {
+        num_cpus() * 4
+    } else {
+        args.jobs
+    };
+    let force = args.force;
+    let verbose = args.verbose;
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = iter_html_files(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to scan", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    if force {
+        eprintln!("Cleaning {} file(s) with {jobs} workers...", files.len());
+    } else {
+        eprintln!("Dry-run: scanning {} file(s) with {jobs} workers...", files.len());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
+    let root_path = std::path::Path::new(root);
+
+    eprintln!("Building file index...");
+    let href_set = Arc::new(crate::clean::build_href_set(root_path));
+    if verbose {
+        eprintln!("Indexed {} file(s)", href_set.len());
+    }
+
+    let (total_broken, mut file_results, errors) = rt.block_on(async {
+        let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let file_total = files.len();
+
+        let mut handles = Vec::with_capacity(files.len());
+        for rel in &files {
+            let rel = rel.clone();
+            let sem = sem.clone();
+            let counter = counter.clone();
+            let root_path = root_path.to_path_buf();
+            let href_set = href_set.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                tokio::task::spawn_blocking(move || {
+                    let path = root_path.join(&rel);
+                    let result = crate::clean::clean_file(&path, &root_path, &href_set, !force);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose {
+                        eprint!("\rScanning: {done}/{file_total} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                    (rel.clone(), result)
+                })
+                .await
+                .unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let mut total_broken = 0usize;
+        let mut errors = Vec::new();
+        let mut file_results: Vec<(String, Vec<crate::clean::BrokenLink>)> = Vec::new();
+
+        for handle in handles {
+            match handle.await {
+                Ok((rel, Ok(result))) => {
+                    if !result.broken_links.is_empty() {
+                        total_broken += result.broken_links.len();
+                        file_results.push((rel, result.broken_links));
+                    }
+                }
+                Ok((rel, Err(e))) => {
+                    errors.push((rel, e));
+                }
+                Err(e) => {
+                    errors.push((String::new(), format!("join error: {e}")));
+                }
+            }
+        }
+
+        (total_broken, file_results, errors)
+    });
+
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+
+    if !errors.is_empty() {
+        eprintln!("Errors:");
+        for (rel, err) in &errors {
+            if rel.is_empty() {
+                eprintln!("  {err}");
+            } else {
+                eprintln!("  {rel}: {err}");
+            }
+        }
+    }
+
+    // Print per-file broken links in hyperlink's format.
+    file_results.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, links) in &file_results {
+        println!("./{rel}");
+        for link in links {
+            println!("  <{} {}=\"{}\">", link.tag, link.attr, link.url);
+        }
+        println!();
+    }
+
+    if force {
+        eprintln!(
+            "Cleaned {} broken link(s) in {} file(s).",
+            total_broken,
+            file_results.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: found {} broken link(s) in {} file(s). Run with --force to fix.",
+            total_broken,
+            file_results.len()
+        );
+    }
+
+    Ok(())
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -540,7 +678,7 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <scan|apply> <ROOT> [flags]");
+            eprintln!("Usage: localize <scan|apply|clean> <ROOT> [flags]");
             return 1;
         }
     };
@@ -548,14 +686,15 @@ pub fn run() -> i32 {
     let result = match args.command.as_deref() {
         Some("scan") => cmd_scan(args),
         Some("apply") => cmd_apply(args),
+        Some("clean") => cmd_clean(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <scan|apply> <ROOT> [flags]");
+            eprintln!("Usage: localize <scan|apply|clean> <ROOT> [flags]");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (scan or apply)");
-            eprintln!("Usage: localize <scan|apply> <ROOT> [flags]");
+            eprintln!("localize: expected subcommand (scan, apply, or clean)");
+            eprintln!("Usage: localize <scan|apply|clean> <ROOT> [flags]");
             return 1;
         }
     };
