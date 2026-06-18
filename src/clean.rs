@@ -1,5 +1,5 @@
-use html5gum::emitters::default::DefaultEmitter;
 use html5gum::Tokenizer;
+use html5gum::emitters::default::DefaultEmitter;
 use rustc_hash::FxHashSet;
 use std::ops::Range;
 use std::path::Path;
@@ -77,7 +77,6 @@ pub fn build_href_set(root: &Path) -> FxHashSet<String> {
     }
     set
 }
-
 
 /// Check whether a URL has an external scheme (http, mailto, etc.).
 /// Matches hyperlink's `is_external_link`.
@@ -253,11 +252,7 @@ fn span_to_range(start: usize, end: usize) -> Range<usize> {
 
 /// Parse the HTML and find all broken local links.
 /// `href_set` is the pre-built set of canonical hrefs from `build_href_set`.
-pub fn scan_file(
-    file_path: &str,
-    html: &str,
-    href_set: &FxHashSet<String>,
-) -> CleanResult {
+pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> CleanResult {
     // Compute the document's canonical href for resolving relative links.
     // Kept as an owned String so we have a stable borrow for the &str used by resolve_href.
     let normalized = file_path.replace('\\', "/");
@@ -301,8 +296,9 @@ pub fn scan_file(
             let attrs_to_check = attrs_to_check.unwrap();
 
             for (name, attr) in &tag.attributes {
-                let attr_name =
-                    std::str::from_utf8(&name[..]).unwrap_or("").to_ascii_lowercase();
+                let attr_name = std::str::from_utf8(&name[..])
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 if !attrs_to_check.contains(&attr_name.as_str()) {
                     continue;
                 }
@@ -322,8 +318,7 @@ pub fn scan_file(
                                 &mut decode_buf,
                             );
                             if !href_set.contains(resolved) {
-                                let url_span =
-                                    find_value_in_attr(raw, attr.span.start, &url_str);
+                                let url_span = find_value_in_attr(raw, attr.span.start, &url_str);
                                 let action = action_for_tag(tag_name);
                                 broken.push(BrokenLink {
                                     url: url_str.to_string(),
@@ -348,8 +343,7 @@ pub fn scan_file(
                         &mut decode_buf,
                     );
                     if !href_set.contains(resolved) {
-                        let url_span =
-                            find_value_in_attr(raw, attr.span.start, attr_value);
+                        let url_span = find_value_in_attr(raw, attr.span.start, attr_value);
                         let action = action_for_tag(tag_name);
                         broken.push(BrokenLink {
                             url: attr_value.to_string(),
@@ -478,18 +472,16 @@ pub fn plan_removals(html: &str, broken_links: &[BrokenLink]) -> Vec<RemovalOp> 
             html5gum::Token::EndTag(tag) => {
                 let tag_name = &tag.name[..];
 
-                if tag_name == b"a" {
-                    if let Some(start_pos) = pending_broken_a.take() {
-                        if broken_links
-                            .iter()
-                            .any(|b| b.tag == "a" && b.tag_span.start == start_pos)
-                        {
-                            removals.push(RemovalOp {
-                                span: span_to_range(tag.span.start, tag.span.end),
-                                description: "remove </a> end tag (broken link)".into(),
-                            });
-                        }
-                    }
+                if tag_name == b"a"
+                    && let Some(start_pos) = pending_broken_a.take()
+                    && broken_links
+                        .iter()
+                        .any(|b| b.tag == "a" && b.tag_span.start == start_pos)
+                {
+                    removals.push(RemovalOp {
+                        span: span_to_range(tag.span.start, tag.span.end),
+                        description: "remove </a> end tag (broken link)".into(),
+                    });
                 }
 
                 let mut pop_idx: Option<usize> = None;
@@ -672,13 +664,7 @@ mod tests {
         let mut scratch = String::new();
         let mut decode = String::new();
         // From glossary/index.html, link to list.html
-        let result = resolve_href(
-            "glossary",
-            true,
-            "list.html",
-            &mut scratch,
-            &mut decode,
-        );
+        let result = resolve_href("glossary", true, "list.html", &mut scratch, &mut decode);
         assert_eq!(result, "glossary/list.html");
     }
 
@@ -700,13 +686,7 @@ mod tests {
     fn test_resolve_href_empty() {
         let mut scratch = String::new();
         let mut decode = String::new();
-        let result = resolve_href(
-            "material/1642.html",
-            false,
-            "",
-            &mut scratch,
-            &mut decode,
-        );
+        let result = resolve_href("material/1642.html", false, "", &mut scratch, &mut decode);
         assert_eq!(result, "material/1642.html");
     }
 
