@@ -55,7 +55,65 @@ impl Default for Args {
     }
 }
 
+fn print_help() {
+    println!(
+        "\
+localize — maintenance toolkit for static HTML sites.
+
+Usage: localize <command> [ROOT] [flags]
+
+Commands:
+  scan     Find remote media URLs in HTML files.
+  apply    Download remote assets and rewrite HTML to use local relative paths.
+  clean    Find and fix broken local links by unwrapping dead <a> tags and
+           removing dead resource elements.
+  zap      Remove HTML elements matching a CSS selector whose inner text
+           contains a query string. Dry-run by default, --apply to remove.
+  towebp   Replace .jpg/.jpeg/.png URL extensions with .webp in href, src,
+           and srcset attributes. Dry-run by default, --apply to rewrite.
+
+Common flags:
+  --include <pattern>   Only process files matching glob pattern (repeatable).
+  --exclude <pattern>   Skip files matching glob pattern (repeatable).
+  --assets-dir <dir>    Asset directory [default: assets/external].
+  --json                Output as JSON (scan, apply).
+  --verbose             Verbose progress output.
+  --jobs <n>            Max parallel workers [default: CPUs × 4].
+  --help, -h            Print this help and exit.
+
+Apply flags:
+  --timeout <s>         Download timeout in seconds [default: 30].
+  --retries <n>         Download retry count [default: 3].
+  --force               Re-download even if asset already exists.
+  --user-agent <str>    Custom User-Agent header.
+  --referer <str>       Custom Referer header.
+  --dry-run             Preview without downloading or rewriting.
+
+Clean flags:
+  --force               Apply fixes (dry-run by default).
+
+Zap flags:
+  --apply               Apply removals (dry-run by default).
+
+Towebp flags:
+  --apply               Apply rewrites (dry-run by default).
+
+Examples:
+  localize scan ~/mysite
+  localize apply ~/mysite --dry-run
+  localize clean ~/mysite --force
+  localize zap p \"Copyright 2019\" ~/mysite --apply
+  localize towebp ~/mysite --apply"
+    );
+}
+
 fn parse_args() -> Result<Args, lexopt::Error> {
+    // Handle --help/-h anywhere, before lexopt rejects it.
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        std::process::exit(0);
+    }
+
     let mut args = Args::default();
     let mut parser = lexopt::Parser::from_env();
 
@@ -140,6 +198,10 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("apply") => {
                 args.apply = true;
+            }
+            Long("help") | Short('h') => {
+                print_help();
+                std::process::exit(0);
             }
             // A bare value after known positionals is the root directory.
             Value(val) if args.root.is_none() => {
@@ -1006,6 +1068,7 @@ pub fn run() -> i32 {
         Err(e) => {
             eprintln!("localize: {e}");
             eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
     };
@@ -1019,11 +1082,13 @@ pub fn run() -> i32 {
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
             eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
             eprintln!("localize: expected subcommand (scan, apply, clean, zap, or towebp)");
             eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
     };

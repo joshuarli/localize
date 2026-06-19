@@ -94,6 +94,22 @@ fn is_remote_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+/// Check whether a URL is an analytics/tracking beacon masquerading as a media URL.
+/// These are typically 1×1 GIFs embedded in <img> tags for data collection,
+/// not real media assets worth localizing.
+fn is_tracking_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let host = parsed.host_str().unwrap_or("");
+    // WordPress.com Stats tracking pixel: pixel.wp.com/g.gif
+    if host == "pixel.wp.com" && parsed.path() == "/g.gif" {
+        return true;
+    }
+    false
+}
+
 /// Given the raw attribute text (name=value) and its absolute span, find the
 /// byte range of just the decoded `value` within the source.
 /// Find the byte range of `value` within raw attribute text at `attr_start`.
@@ -214,9 +230,13 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                                 }
                             }
                         } else if is_remote_url(attr_value) {
-                            // <a href> is for navigation, not media — only
+                            // Skip analytics/tracking beacons (e.g. pixel.wp.com/g.gif).
+                            if is_tracking_url(attr_value) {
+                                continue;
+                            }
+                            // <a> and <link> are for navigation, not media — only
                             // match if the URL points to a media file.
-                            if tag_name == b"a" && !is_media_url(attr_value) {
+                            if (tag_name == b"a" || tag_name == b"link") && !is_media_url(attr_value) {
                                 continue;
                             }
                             if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
@@ -632,6 +652,48 @@ mod tests {
         // has no extension, so is_media_url returns false for <a> tags. But this test
         // verifies the entity doesn't cause a panic regardless.
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_link_href_ignores_non_media() {
+        // RSS feed, canonical URL, REST API — not media assets.
+        let html = r#"<link rel="alternate" type="application/rss+xml" href="https://islandblacksmith.ca/feed/">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_tracking_pixel_ignored() {
+        // WordPress Stats tracking beacon — not a real media asset.
+        let html = r#"<img src="https://pixel.wp.com/g.gif?v=ext&blog=123&post=1&rand=0.123" alt="" width="6" height="5" id="wpstats">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_real_gif_still_matched() {
+        // A real .gif file on a regular host is still matched.
+        let html = r#"<img src="https://cdn.example.com/animation.gif">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+    }
+
+    #[test]
+    fn test_gif_on_non_tracking_host() {
+        // g.gif on a non-tracking domain is still matched.
+        let html = r#"<img src="https://example.com/g.gif">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+    }
+
+    #[test]
+    fn test_link_href_media() {
+        // <link> to a CSS or font file is a media asset.
+        let html = r#"<link rel="stylesheet" href="https://cdn.example.com/vendor.css">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].tag, "link");
+        assert_eq!(result.references[0].attr, "href");
     }
 
     #[test]
