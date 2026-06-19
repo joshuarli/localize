@@ -239,9 +239,21 @@ fn tag_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
 }
 
 fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Range<usize> {
-    let offset = raw.find(value).unwrap_or(0);
-    let start = attr_start + offset;
-    start..start + value.len()
+    // Fast path: literal match.
+    if let Some(offset) = raw.find(value) {
+        let start = attr_start + offset;
+        return start..start + value.len();
+    }
+    // HTML entity in query string: &amp; is the decoded &.
+    if value.contains('&') {
+        let substituted = value.replace('&', "&amp;");
+        if let Some(offset) = raw.find(&substituted) {
+            let start = attr_start + offset;
+            return start..start + substituted.len();
+        }
+    }
+    // Fallback: return a zero-length span at the attribute start.
+    attr_start..attr_start
 }
 
 fn line_of_offset(source: &str, offset: usize) -> usize {
@@ -293,10 +305,9 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
             let tag_name = &tag.name[..];
             let attrs_to_check = tag_attrs(tag_name);
 
-            if attrs_to_check.is_none() {
+            let Some(attrs_to_check) = attrs_to_check else {
                 continue;
-            }
-            let attrs_to_check = attrs_to_check.unwrap();
+            };
 
             for (name, attr) in &tag.attributes {
                 let attr_name = std::str::from_utf8(&name[..])

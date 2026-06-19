@@ -96,12 +96,22 @@ fn is_remote_url(url: &str) -> bool {
 
 /// Given the raw attribute text (name=value) and its absolute span, find the
 /// byte range of just the decoded `value` within the source.
-fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Range<usize> {
-    let offset = raw
-        .find(value)
-        .expect("decoded value must appear in raw attr text");
-    let start = attr_start + offset;
-    start..start + value.len()
+/// Find the byte range of `value` within raw attribute text at `attr_start`.
+/// Handles HTML entities: the decoded value from html5gum may differ from the
+/// raw source (e.g. `&amp;` → `&`).
+fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Option<Range<usize>> {
+    // Fast path: literal match.
+    if let Some(offset) = raw.find(value) {
+        return Some(attr_start + offset..attr_start + offset + value.len());
+    }
+    // HTML entity in query string: `&amp;` is the decoded `&`.
+    if value.contains('&') {
+        let substituted = value.replace('&', "&amp;");
+        if let Some(offset) = raw.find(&substituted) {
+            return Some(attr_start + offset..attr_start + offset + substituted.len());
+        }
+    }
+    None
 }
 
 pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
@@ -141,15 +151,16 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                             for m in CSS_URL_RE.captures_iter(val) {
                                 if let Some(url_match) = m.get(1) {
                                     let url = url_match.as_str();
-                                    let url_span = find_value_in_attr(raw, attr.span.start, url);
-                                    refs.push(MediaReference {
-                                        file_path: file_path.to_string(),
-                                        tag: "style".into(),
-                                        attr: "style".into(),
-                                        url: url.to_string(),
-                                        span: url_span,
-                                        descriptor: None,
-                                    });
+                                    if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
+                                        refs.push(MediaReference {
+                                            file_path: file_path.to_string(),
+                                            tag: "style".into(),
+                                            attr: "style".into(),
+                                            url: url.to_string(),
+                                            span: url_span,
+                                            descriptor: None,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -188,17 +199,18 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                         if attr_name == "srcset" {
                             for (url, descriptor) in parse_srcset_entries(attr_value) {
                                 if is_remote_url(&url) {
-                                    let url_span = find_value_in_attr(raw, attr.span.start, &url);
-                                    refs.push(MediaReference {
-                                        file_path: file_path.to_string(),
-                                        tag: std::str::from_utf8(tag_name)
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        attr: "srcset".into(),
-                                        url: url.to_string(),
-                                        span: url_span,
-                                        descriptor,
-                                    });
+                                    if let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url) {
+                                        refs.push(MediaReference {
+                                            file_path: file_path.to_string(),
+                                            tag: std::str::from_utf8(tag_name)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            attr: "srcset".into(),
+                                            url: url.to_string(),
+                                            span: url_span,
+                                            descriptor,
+                                        });
+                                    }
                                 }
                             }
                         } else if is_remote_url(attr_value) {
@@ -207,15 +219,16 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                             if tag_name == b"a" && !is_media_url(attr_value) {
                                 continue;
                             }
-                            let url_span = find_value_in_attr(raw, attr.span.start, attr_value);
-                            refs.push(MediaReference {
-                                file_path: file_path.to_string(),
-                                tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
-                                attr: attr_name.to_string(),
-                                url: attr_value.to_string(),
-                                span: url_span,
-                                descriptor: None,
-                            });
+                            if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
+                                refs.push(MediaReference {
+                                    file_path: file_path.to_string(),
+                                    tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
+                                    attr: attr_name.to_string(),
+                                    url: attr_value.to_string(),
+                                    span: url_span,
+                                    descriptor: None,
+                                });
+                            }
                         }
                     }
 
@@ -230,16 +243,18 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                                     let content_val = std::str::from_utf8(&cattr[..]).unwrap_or("");
                                     if is_remote_url(content_val) {
                                         let craw = &html[cattr.span.start..cattr.span.end];
-                                        let url_span =
-                                            find_value_in_attr(craw, cattr.span.start, content_val);
-                                        refs.push(MediaReference {
-                                            file_path: file_path.to_string(),
-                                            tag: "meta".into(),
-                                            attr: "content".into(),
-                                            url: content_val.to_string(),
-                                            span: url_span,
-                                            descriptor: None,
-                                        });
+                                        if let Some(url_span) =
+                                            find_value_in_attr(craw, cattr.span.start, content_val)
+                                        {
+                                            refs.push(MediaReference {
+                                                file_path: file_path.to_string(),
+                                                tag: "meta".into(),
+                                                attr: "content".into(),
+                                                url: content_val.to_string(),
+                                                span: url_span,
+                                                descriptor: None,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -251,15 +266,16 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                         for m in CSS_URL_RE.captures_iter(attr_value) {
                             if let Some(url_match) = m.get(1) {
                                 let url = url_match.as_str();
-                                let url_span = find_value_in_attr(raw, attr.span.start, url);
-                                refs.push(MediaReference {
-                                    file_path: file_path.to_string(),
-                                    tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
-                                    attr: "style".into(),
-                                    url: url.to_string(),
-                                    span: url_span,
-                                    descriptor: None,
-                                });
+                                if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
+                                    refs.push(MediaReference {
+                                        file_path: file_path.to_string(),
+                                        tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
+                                        attr: "style".into(),
+                                        url: url.to_string(),
+                                        span: url_span,
+                                        descriptor: None,
+                                    });
+                                }
                             }
                         }
                     }
@@ -269,6 +285,9 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
             html5gum::Token::EndTag(tag) if in_style && &tag.name[..] == b"style" => {
                 in_style = false;
                 // Scan collected style content for CSS url() references.
+                if style_start > tag.span.start || style_start > html.len() || tag.span.start > html.len() {
+                    continue;
+                }
                 let style_content = &html[style_start..tag.span.start];
                 for m in CSS_URL_RE.captures_iter(style_content) {
                     if let Some(url_match) = m.get(1) {
@@ -601,5 +620,32 @@ mod tests {
         let r = &result.references[0];
         let extracted = &html[r.span.start..r.span.end];
         assert_eq!(extracted, "https://example.com/img.png");
+    }
+
+    #[test]
+    fn test_entity_in_url() {
+        // &amp; in query string should not cause a panic.
+        let html = r#"<a href="https://example.com/page?a=1&amp;b=2">link</a>"#;
+        let result = scan_file("test.html", html);
+        // Should find the reference (URL with query params is treated as a media-like URL
+        // because it ends with "?a=1&amp;b=2" — actually the decoded value "?a=1&b=2"
+        // has no extension, so is_media_url returns false for <a> tags. But this test
+        // verifies the entity doesn't cause a panic regardless.
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_amp_entity_in_srcset() {
+        let html =
+            r#"<img srcset="https://a.com/img.jpg?w=400&amp;h=300 400w, https://a.com/img.jpg 800w">"#;
+        let result = scan_file("test.html", html);
+        assert!(result.error.is_none());
+        assert_eq!(result.references.len(), 2);
+        assert_eq!(
+            result.references[0].url,
+            "https://a.com/img.jpg?w=400&h=300"
+        );
+        let extracted = &html[result.references[0].span.start..result.references[0].span.end];
+        assert_eq!(extracted, "https://a.com/img.jpg?w=400&amp;h=300");
     }
 }

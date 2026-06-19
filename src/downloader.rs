@@ -18,7 +18,15 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 const MAX_REDIRECTS: u32 = 10;
 
 pub fn asset_path(url: &str, assets_dir: &str) -> String {
-    let parsed = url::Url::parse(url).unwrap();
+    let parsed = match url::Url::parse(url) {
+        Ok(p) => p,
+        Err(_) => {
+            // Fallback for unparsable URLs: hash the raw string.
+            let hash = ring::digest::digest(&ring::digest::SHA256, url.as_bytes());
+            let hash_hex: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            return format!("{assets_dir}/unparsable/{hash_hex}-file");
+        }
+    };
     let host = parsed.host_str().unwrap_or("unknown");
     let basename = parsed
         .path_segments()
