@@ -232,7 +232,7 @@ pub(crate) fn is_remote_url(url: &str) -> bool {
     if url.is_empty() {
         return false;
     }
-    url.starts_with("http://") || url.starts_with("https://")
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("//")
 }
 
 fn is_local_media_ref(url: &str) -> bool {
@@ -245,7 +245,6 @@ fn is_local_media_ref(url: &str) -> bool {
     if url.starts_with("data:")
         || url.starts_with("javascript:")
         || url.starts_with("mailto:")
-        || url.starts_with("//")
     {
         return false;
     }
@@ -255,15 +254,31 @@ fn is_local_media_ref(url: &str) -> bool {
 /// Check whether a URL is an analytics/tracking beacon masquerading as a media URL.
 /// These are typically 1×1 GIFs embedded in <img> tags for data collection,
 /// not real media assets worth localizing.
+/// Matches any host with a "pixel" subdomain (e.g. pixel.wp.com, pixel.facebook.com),
+/// matching the same logic used by grab's `is_tracking_subdomain`.
 fn is_tracking_url(url: &str) -> bool {
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
         Err(_) => return false,
     };
     let host = parsed.host_str().unwrap_or("");
-    // WordPress.com Stats tracking pixel: pixel.wp.com/g.gif
-    if host == "pixel.wp.com" && parsed.path() == "/g.gif" {
-        return true;
+    host.to_lowercase()
+        .split('.')
+        .any(|part| part == "pixel")
+}
+
+/// Check whether a local URL path represents a tracking pixel that was
+/// rewritten by the grab tool (e.g. `_grab/pixel.wp.com/g__q-252f96.gif`).
+/// When the HTML rewriter misses a tracking pixel, its src is rewritten to a
+/// local path but the asset is never downloaded — producing a false broken
+/// URL report. This check suppresses those false positives.
+fn is_tracking_local_url(url: &str) -> bool {
+    let path = url.trim_start_matches('/');
+    let segments: Vec<&str> = path.split('/').collect();
+    if let Some(pos) = segments.iter().position(|&s| s == "_grab") {
+        if let Some(host) = segments.get(pos + 1) {
+            return host.to_lowercase().split('.').any(|p| p == "pixel");
+        }
     }
     false
 }
@@ -432,6 +447,9 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                         if attr_name == "srcset" {
                             for (url, descriptor) in parse_srcset_entries(attr_value) {
                                 if is_remote_url(&url) {
+                                    if is_tracking_url(&url) {
+                                        continue;
+                                    }
                                     if let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url) {
                                         push_ref(
                                             MediaTag::from_bytes(tag_name),
@@ -444,6 +462,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                     }
                                 } else if is_local_media_ref(&url)
                                     && is_broken(&url)
+                                    && !is_tracking_local_url(&url)
                                     && let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url)
                                 {
                                     push_ref(
@@ -473,7 +492,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                     false,
                                 );
                             }
-                        } else if is_local_media_ref(attr_value) && is_broken(attr_value) {
+                        } else if is_local_media_ref(attr_value) && is_broken(attr_value) && !is_tracking_local_url(attr_value) {
                             if (tag_name == b"a" || tag_name == b"link") && !is_media_url(attr_value) {
                                 continue;
                             }
@@ -508,6 +527,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                         }
                                     } else if is_local_media_ref(content_val)
                                         && is_broken(content_val)
+                                        && !is_tracking_local_url(content_val)
                                         && let Some(url_span) =
                                             find_value_in_attr(craw, cattr.span.start, content_val)
                                     {
@@ -523,6 +543,9 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                         for m in CSS_URL_RE.captures_iter(attr_value) {
                             if let Some(url_match) = m.get(1) {
                                 let url = url_match.as_str();
+                                if is_tracking_url(url) {
+                                    continue;
+                                }
                                 if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
                                     push_ref(
                                         MediaTag::Style,
@@ -549,6 +572,9 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                 for m in CSS_URL_RE.captures_iter(style_content) {
                     if let Some(url_match) = m.get(1) {
                         let url = url_match.as_str();
+                        if is_tracking_url(url) {
+                            continue;
+                        }
                         let abs_start = style_start + url_match.start();
                         let abs_end = style_start + url_match.end();
                         push_ref(MediaTag::Style, MediaAttr::Css, url, abs_start..abs_end, None, false);
@@ -602,6 +628,7 @@ mod tests {
     fn test_is_remote_url() {
         assert!(is_remote_url("http://example.com/img.png"));
         assert!(is_remote_url("https://example.com/img.png"));
+        assert!(is_remote_url("//cdn.example.com/logo.png"));
         assert!(!is_remote_url("images/photo.jpg"));
         assert!(!is_remote_url("/assets/banner.png"));
         assert!(!is_remote_url("data:image/png;base64,abc"));
@@ -926,6 +953,83 @@ mod tests {
     }
 
     #[test]
+    fn test_tracking_local_url_wpstats_ignored() {
+        // Local path rewritten by grab from pixel.wp.com — should be
+        // recognized as a tracking artifact, not reported as broken.
+        let html = r#"<img src="_grab/pixel.wp.com/g__q-252f96.gif" alt="" width="6" height="5" id="wpstats">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_tracking_local_url_pixel_facebook_ignored() {
+        // Local path from pixel.facebook.com — tracking host.
+        let html = r#"<img src="_grab/pixel.facebook.com/tr__q-a1b2c3.gif" width="6" height="5">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_tracking_local_url_non_tracking_reported() {
+        // Local path from a non-tracking host — still reported as broken.
+        let html = r#"<img src="_grab/cdn.example.com/animation.gif">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 1);
+        assert!(result.references[0].broken);
+        assert_eq!(s(&result.references[0].url), "_grab/cdn.example.com/animation.gif");
+    }
+
+    #[test]
+    fn test_tracking_local_url_pixelperfect_not_ignored() {
+        // pixelperfect.com is not a tracking host (no standalone "pixel" subdomain).
+        let html = r#"<img src="_grab/pixelperfect.com/images/logo.png">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 1);
+        assert!(result.references[0].broken);
+    }
+
+    #[test]
+    fn test_tracking_url_pixel_subdomain_ignored() {
+        // Any host with a "pixel" subdomain is filtered.
+        let html = r#"<img src="https://pixel.facebook.com/tr?id=123">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_tracking_url_non_pixel_host_matched() {
+        // Non-pixel hosts with g.gif are still matched (not filtering based on path).
+        let html = r#"<img src="https://example.com/g.gif">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 1);
+    }
+
+    #[test]
+    fn test_srcset_tracking_url_ignored() {
+        // Tracking URL in srcset is filtered out.
+        let html = r#"<img srcset="https://pixel.wp.com/g.gif 1x, https://cdn.example.com/real.jpg 2x">"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(s(&result.references[0].url), "https://cdn.example.com/real.jpg");
+    }
+
+    #[test]
+    fn test_inline_style_tracking_url_ignored() {
+        // Tracking URL in inline style url() is filtered.
+        let html = r#"<div style="background: url(https://pixel.wp.com/g.gif)"></div>"#;
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_style_block_tracking_url_ignored() {
+        // Tracking URL in <style> block url() is filtered.
+        let html = "<style>.bg { background: url(https://pixel.wp.com/g.gif); }</style>";
+        let result = scan_file("test.html", html, &FxHashSet::default());
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
     fn test_real_gif_still_matched() {
         // A real .gif file on a regular host is still matched.
         let html = r#"<img src="https://cdn.example.com/animation.gif">"#;
@@ -1075,10 +1179,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ignores_protocol_relative() {
-        // Protocol-relative URLs (//example.com/foo) are not local.
+    fn test_protocol_relative_treated_as_remote() {
+        // Protocol-relative URLs (//example.com/foo) are treated as remote.
         let html = r#"<img src="//cdn.example.com/logo.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
-        assert_eq!(result.references.len(), 0);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(s(&result.references[0].url), "//cdn.example.com/logo.png");
+        assert!(!result.references[0].broken);
     }
 }
