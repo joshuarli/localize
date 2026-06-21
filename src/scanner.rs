@@ -3,20 +3,154 @@ use html5gum::emitters::default::DefaultEmitter;
 use regex_lite::Regex;
 use rustc_hash::FxHashSet;
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 static CSS_URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"url\(\s*["']?\s*(https?://[^"'\s()]+)\s*["']?\s*\)"#).unwrap());
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaTag {
+    A,
+    Img,
+    Link,
+    Script,
+    Style,
+    Meta,
+    Video,
+    Audio,
+    Source,
+    Track,
+    Object,
+    Other(Box<str>),
+}
+
+impl MediaTag {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        match bytes {
+            b"a" => Self::A,
+            b"img" => Self::Img,
+            b"link" => Self::Link,
+            b"script" => Self::Script,
+            b"style" => Self::Style,
+            b"meta" => Self::Meta,
+            b"video" => Self::Video,
+            b"audio" => Self::Audio,
+            b"source" => Self::Source,
+            b"track" => Self::Track,
+            b"object" => Self::Object,
+            other => Self::Other(
+                String::from_utf8_lossy(other).into_owned().into_boxed_str(),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for MediaTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::A => f.write_str("a"),
+            Self::Img => f.write_str("img"),
+            Self::Link => f.write_str("link"),
+            Self::Script => f.write_str("script"),
+            Self::Style => f.write_str("style"),
+            Self::Meta => f.write_str("meta"),
+            Self::Video => f.write_str("video"),
+            Self::Audio => f.write_str("audio"),
+            Self::Source => f.write_str("source"),
+            Self::Track => f.write_str("track"),
+            Self::Object => f.write_str("object"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MediaAttr {
+    Src,
+    Href,
+    Data,
+    Content,
+    Style,
+    Css,
+    Srcset,
+}
+
+impl MediaAttr {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "src" => Self::Src,
+            "href" => Self::Href,
+            "data" => Self::Data,
+            "content" => Self::Content,
+            "style" => Self::Style,
+            "css" => Self::Css,
+            "srcset" => Self::Srcset,
+            _ => unreachable!("unknown media attr: {s}"),
+        }
+    }
+}
+
+impl std::fmt::Display for MediaAttr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Src => "src",
+            Self::Href => "href",
+            Self::Data => "data",
+            Self::Content => "content",
+            Self::Style => "style",
+            Self::Css => "css",
+            Self::Srcset => "srcset",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrcsetDescriptor {
+    /// Width descriptor, e.g. `400w`. Stored as the numeric value.
+    Width(u16),
+    /// Pixel density descriptor, e.g. `2x`. Stored as numerator × 100 (2x = 200).
+    Density(u16),
+}
+
+impl SrcsetDescriptor {
+    fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if let Some(n) = raw.strip_suffix('w').and_then(|s| s.parse::<u16>().ok()) {
+            Some(Self::Width(n))
+        } else {
+            raw.strip_suffix('x')
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|n| Self::Density((n * 100.0) as u16))
+        }
+    }
+}
+
+impl std::fmt::Display for SrcsetDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Width(n) => write!(f, "{n}w"),
+            Self::Density(n) => {
+                let d = *n as f64 / 100.0;
+                if d.fract() == 0.0 {
+                    write!(f, "{}x", d as u32)
+                } else {
+                    write!(f, "{d}x")
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaReference {
-    pub file_path: String,
-    pub tag: String,
-    pub attr: String,
-    pub url: String,
+    pub file_path: Arc<str>,
+    pub tag: MediaTag,
+    pub attr: MediaAttr,
+    pub url: Box<str>,
     /// Byte range of the URL in the source file.
     pub span: Range<usize>,
-    pub descriptor: Option<String>,
+    pub descriptor: Option<SrcsetDescriptor>,
     /// true if this is a local URL whose file does not exist on disk.
     pub broken: bool,
     /// 1-based line number of the URL in the source file.
@@ -156,7 +290,6 @@ fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Option<Range
 
 pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> ScanResult {
     // Fast path: skip files that can't possibly contain media references.
-    // memchr-powered substring search, much faster than full tokenization.
     if !html.contains("src=")
         && !html.contains("href=")
         && !html.contains("url(")
@@ -193,17 +326,18 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
         .chain(html.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
 
-    let mut push_ref = |tag: &str, attr: &str, url: &str, span: Range<usize>, descriptor: Option<String>, broken: bool| {
+    let file_path: Arc<str> = Arc::from(file_path);
+    let mut push_ref = |tag: MediaTag, attr: MediaAttr, url: &str, span: Range<usize>, descriptor: Option<SrcsetDescriptor>, broken: bool| {
         let line = match line_starts.binary_search(&span.start) {
             Ok(i) => i + 1,
             Err(i) => i,
         };
         let col = span.start - line_starts[line - 1] + 1;
         refs.push(MediaReference {
-            file_path: file_path.to_string(),
-            tag: tag.to_string(),
-            attr: attr.to_string(),
-            url: url.to_string(),
+            file_path: Arc::clone(&file_path),
+            tag,
+            attr,
+            url: url.to_string().into_boxed_str(),
             span,
             descriptor,
             broken,
@@ -258,7 +392,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                 if let Some(url_match) = m.get(1) {
                                     let url = url_match.as_str();
                                     if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
-                                        push_ref("style", "style", url, url_span, None, false);
+                                        push_ref(MediaTag::Style, MediaAttr::Style, url, url_span, None, false);
                                     }
                                 }
                             }
@@ -300,8 +434,8 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                 if is_remote_url(&url) {
                                     if let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url) {
                                         push_ref(
-                                            std::str::from_utf8(tag_name).unwrap_or(""),
-                                            "srcset",
+                                            MediaTag::from_bytes(tag_name),
+                                            MediaAttr::Srcset,
                                             &url,
                                             url_span,
                                             descriptor,
@@ -313,8 +447,8 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                     && let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url)
                                 {
                                     push_ref(
-                                        std::str::from_utf8(tag_name).unwrap_or(""),
-                                        "srcset",
+                                        MediaTag::from_bytes(tag_name),
+                                        MediaAttr::Srcset,
                                         &url,
                                         url_span,
                                         descriptor,
@@ -331,8 +465,8 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                             }
                             if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
                                 push_ref(
-                                    std::str::from_utf8(tag_name).unwrap_or(""),
-                                    attr_name,
+                                    MediaTag::from_bytes(tag_name),
+                                    MediaAttr::from_str(attr_name),
                                     attr_value,
                                     url_span,
                                     None,
@@ -345,8 +479,8 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                             }
                             if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
                                 push_ref(
-                                    std::str::from_utf8(tag_name).unwrap_or(""),
-                                    attr_name,
+                                    MediaTag::from_bytes(tag_name),
+                                    MediaAttr::from_str(attr_name),
                                     attr_value,
                                     url_span,
                                     None,
@@ -370,14 +504,14 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                         if let Some(url_span) =
                                             find_value_in_attr(craw, cattr.span.start, content_val)
                                         {
-                                            push_ref("meta", "content", content_val, url_span, None, false);
+                                            push_ref(MediaTag::Meta, MediaAttr::Content, content_val, url_span, None, false);
                                         }
                                     } else if is_local_media_ref(content_val)
                                         && is_broken(content_val)
                                         && let Some(url_span) =
                                             find_value_in_attr(craw, cattr.span.start, content_val)
                                     {
-                                        push_ref("meta", "content", content_val, url_span, None, true);
+                                        push_ref(MediaTag::Meta, MediaAttr::Content, content_val, url_span, None, true);
                                     }
                                 }
                             }
@@ -391,8 +525,8 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                                 let url = url_match.as_str();
                                 if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
                                     push_ref(
-                                        std::str::from_utf8(tag_name).unwrap_or(""),
-                                        "style",
+                                        MediaTag::Style,
+                                        MediaAttr::Style,
                                         url,
                                         url_span,
                                         None,
@@ -417,7 +551,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
                         let url = url_match.as_str();
                         let abs_start = style_start + url_match.start();
                         let abs_end = style_start + url_match.end();
-                        push_ref("style", "css", url, abs_start..abs_end, None, false);
+                        push_ref(MediaTag::Style, MediaAttr::Css, url, abs_start..abs_end, None, false);
                     }
                 }
             }
@@ -433,7 +567,7 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
 }
 
 /// Parse srcset entries. Returns Vec of (url, optional_descriptor).
-fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
+fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<SrcsetDescriptor>)> {
     let mut entries = Vec::new();
     for part in raw.split(',') {
         let part = part.trim();
@@ -446,7 +580,7 @@ fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
         }
         let url = tokens[0];
         let descriptor = if tokens.len() > 1 {
-            Some(tokens[1..].join(" "))
+            SrcsetDescriptor::parse(tokens[1])
         } else {
             None
         };
@@ -454,6 +588,11 @@ fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
     }
     entries
 }
+
+
+/// Test helper: deref Box<str> or Arc<str> to &str for assert_eq! comparisons.
+#[cfg(test)]
+fn s<T: std::ops::Deref<Target = str>>(v: &T) -> &str { v }
 
 #[cfg(test)]
 mod tests {
@@ -479,9 +618,9 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(result.references.len(), 1);
         let r = &result.references[0];
-        assert_eq!(r.tag, "img");
-        assert_eq!(r.attr, "src");
-        assert_eq!(r.url, "https://cdn.example.com/logo.png");
+        assert_eq!(r.tag, MediaTag::Img);
+        assert_eq!(r.attr, MediaAttr::Src);
+        assert_eq!(s(&r.url), "https://cdn.example.com/logo.png");
         // Verify the span extracts the correct URL.
         assert_eq!(
             &html[r.span.start..r.span.end],
@@ -494,10 +633,10 @@ mod tests {
         let html = r#"<img srcset="https://a.com/s.jpg 400w, https://a.com/l.jpg 800w">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 2);
-        assert_eq!(result.references[0].url, "https://a.com/s.jpg");
-        assert_eq!(result.references[0].descriptor.as_deref(), Some("400w"));
-        assert_eq!(result.references[1].url, "https://a.com/l.jpg");
-        assert_eq!(result.references[1].descriptor.as_deref(), Some("800w"));
+        assert_eq!(s(&result.references[0].url), "https://a.com/s.jpg");
+        assert_eq!(result.references[0].descriptor, Some(SrcsetDescriptor::Width(400)));
+        assert_eq!(s(&result.references[1].url), "https://a.com/l.jpg");
+        assert_eq!(result.references[1].descriptor, Some(SrcsetDescriptor::Width(800)));
     }
 
     #[test]
@@ -506,7 +645,7 @@ mod tests {
         // Empty set → file is treated as missing.
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "images/photo.jpg");
+        assert_eq!(s(&result.references[0].url), "images/photo.jpg");
         assert!(result.references[0].broken);
     }
 
@@ -531,9 +670,9 @@ mod tests {
         let html = r#"<meta property="og:image" content="https://cdn.example.com/hero.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "meta");
-        assert_eq!(result.references[0].attr, "content");
-        assert_eq!(result.references[0].url, "https://cdn.example.com/hero.png");
+        assert_eq!(result.references[0].tag, MediaTag::Meta);
+        assert_eq!(result.references[0].attr, MediaAttr::Content);
+        assert_eq!(s(&result.references[0].url), "https://cdn.example.com/hero.png");
     }
 
     #[test]
@@ -541,7 +680,7 @@ mod tests {
         let html = r#"<meta name="twitter:image" content="https://cdn.example.com/hero.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "https://cdn.example.com/hero.png");
+        assert_eq!(s(&result.references[0].url), "https://cdn.example.com/hero.png");
     }
 
     #[test]
@@ -549,9 +688,9 @@ mod tests {
         let html = r#"<div style="background: url(https://cdn.example.com/bg.png)"></div>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "div");
-        assert_eq!(result.references[0].attr, "style");
-        assert_eq!(result.references[0].url, "https://cdn.example.com/bg.png");
+        assert_eq!(result.references[0].tag, MediaTag::Style);
+        assert_eq!(result.references[0].attr, MediaAttr::Style);
+        assert_eq!(s(&result.references[0].url), "https://cdn.example.com/bg.png");
         assert_eq!(
             &html[result.references[0].span.start..result.references[0].span.end],
             "https://cdn.example.com/bg.png"
@@ -563,9 +702,9 @@ mod tests {
         let html = "<style>.bg { background: url(https://cdn.example.com/bg.jpg); }</style>";
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "style");
-        assert_eq!(result.references[0].attr, "css");
-        assert_eq!(result.references[0].url, "https://cdn.example.com/bg.jpg");
+        assert_eq!(result.references[0].tag, MediaTag::Style);
+        assert_eq!(result.references[0].attr, MediaAttr::Css);
+        assert_eq!(s(&result.references[0].url), "https://cdn.example.com/bg.jpg");
     }
 
     #[test]
@@ -573,7 +712,7 @@ mod tests {
         let html = r#"<video src="https://media.example.com/video.mp4"></video>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "video");
+        assert_eq!(result.references[0].tag, MediaTag::Video);
     }
 
     #[test]
@@ -581,8 +720,8 @@ mod tests {
         let html = r#"<link rel="stylesheet" href="https://cdn.example.com/vendor.css">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "link");
-        assert_eq!(result.references[0].attr, "href");
+        assert_eq!(result.references[0].tag, MediaTag::Link);
+        assert_eq!(result.references[0].attr, MediaAttr::Href);
     }
 
     #[test]
@@ -590,8 +729,8 @@ mod tests {
         let html = r#"<script src="https://cdn.example.com/vendor.js"></script>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "script");
-        assert_eq!(result.references[0].attr, "src");
+        assert_eq!(result.references[0].tag, MediaTag::Script);
+        assert_eq!(result.references[0].attr, MediaAttr::Src);
     }
 
     #[test]
@@ -599,8 +738,8 @@ mod tests {
         let html = r#"<object data="https://docs.example.com/doc.pdf"></object>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "object");
-        assert_eq!(result.references[0].attr, "data");
+        assert_eq!(result.references[0].tag, MediaTag::Object);
+        assert_eq!(result.references[0].attr, MediaAttr::Data);
     }
 
     #[test]
@@ -608,7 +747,7 @@ mod tests {
         let html = r#"<img src="https://cdn.example.com/logo.png"><img src="https://cdn.example.com/logo.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 2);
-        assert_eq!(result.references[0].url, result.references[1].url);
+        assert_eq!(s(&result.references[0].url), s(&result.references[1].url));
     }
 
     #[test]
@@ -616,7 +755,7 @@ mod tests {
         let html = r#"<img src="/assets/logo.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "/assets/logo.png");
+        assert_eq!(s(&result.references[0].url), "/assets/logo.png");
     }
 
     #[test]
@@ -625,8 +764,8 @@ mod tests {
         let html = r#"<link rel="stylesheet" href="local/style.css">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "local/style.css");
-        assert_eq!(result.references[0].tag, "link");
+        assert_eq!(s(&result.references[0].url), "local/style.css");
+        assert_eq!(result.references[0].tag, MediaTag::Link);
     }
 
     #[test]
@@ -650,7 +789,7 @@ mod tests {
         let html = r#"<audio src="https://media.example.com/audio.mp3"></audio>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "audio");
+        assert_eq!(result.references[0].tag, MediaTag::Audio);
     }
 
     #[test]
@@ -658,7 +797,7 @@ mod tests {
         let html = r#"<source src="https://media.example.com/video.mp4">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "source");
+        assert_eq!(result.references[0].tag, MediaTag::Source);
     }
 
     #[test]
@@ -666,7 +805,7 @@ mod tests {
         let html = r#"<source srcset="https://a.com/b.webp 1x, https://a.com/b2x.webp 2x">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 2);
-        assert_eq!(result.references[0].attr, "srcset");
+        assert_eq!(result.references[0].attr, MediaAttr::Srcset);
     }
 
     #[test]
@@ -674,7 +813,7 @@ mod tests {
         let html = r#"<track src="https://media.example.com/subtitles.vtt">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "track");
+        assert_eq!(result.references[0].tag, MediaTag::Track);
     }
 
     #[test]
@@ -688,7 +827,7 @@ mod tests {
         let style_refs: Vec<_> = result
             .references
             .iter()
-            .filter(|r| r.attr == "css")
+            .filter(|r| r.attr == MediaAttr::Css)
             .collect();
         assert_eq!(style_refs.len(), 1);
         // Verify the span falls inside the <style> element.
@@ -709,10 +848,10 @@ mod tests {
             r#"<a href="https://s3-us-west-2.amazonaws.com/reference/images/pic.jpg">link</a>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "a");
-        assert_eq!(result.references[0].attr, "href");
+        assert_eq!(result.references[0].tag, MediaTag::A);
+        assert_eq!(result.references[0].attr, MediaAttr::Href);
         assert_eq!(
-            result.references[0].url,
+            s(&result.references[0].url),
             "https://s3-us-west-2.amazonaws.com/reference/images/pic.jpg"
         );
     }
@@ -745,7 +884,7 @@ mod tests {
         let html = r#"<a href="https://s3.amazonaws.com/bucket/photo.jpg">img</a>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "a");
+        assert_eq!(result.references[0].tag, MediaTag::A);
     }
 
     #[test]
@@ -808,8 +947,8 @@ mod tests {
         let html = r#"<link rel="stylesheet" href="https://cdn.example.com/vendor.css">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].tag, "link");
-        assert_eq!(result.references[0].attr, "href");
+        assert_eq!(result.references[0].tag, MediaTag::Link);
+        assert_eq!(result.references[0].attr, MediaAttr::Href);
     }
 
     #[test]
@@ -820,7 +959,7 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(result.references.len(), 2);
         assert_eq!(
-            result.references[0].url,
+            s(&result.references[0].url),
             "https://a.com/img.jpg?w=400&h=300"
         );
         let extracted = &html[result.references[0].span.start..result.references[0].span.end];
@@ -832,8 +971,8 @@ mod tests {
         let html = r#"<a href="docs/manual.pdf">PDF</a>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "docs/manual.pdf");
-        assert_eq!(result.references[0].tag, "a");
+        assert_eq!(s(&result.references[0].url), "docs/manual.pdf");
+        assert_eq!(result.references[0].tag, MediaTag::A);
     }
 
     #[test]
@@ -848,8 +987,8 @@ mod tests {
         let html = r#"<video src="media/intro.mp4"></video>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "media/intro.mp4");
-        assert_eq!(result.references[0].tag, "video");
+        assert_eq!(s(&result.references[0].url), "media/intro.mp4");
+        assert_eq!(result.references[0].tag, MediaTag::Video);
     }
 
     #[test]
@@ -857,8 +996,8 @@ mod tests {
         let html = r#"<script src="js/app.js"></script>"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "js/app.js");
-        assert_eq!(result.references[0].tag, "script");
+        assert_eq!(s(&result.references[0].url), "js/app.js");
+        assert_eq!(result.references[0].tag, MediaTag::Script);
     }
 
     #[test]
@@ -866,10 +1005,10 @@ mod tests {
         let html = r#"<img srcset="img/small.jpg 400w, img/large.jpg 800w">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 2);
-        assert_eq!(result.references[0].url, "img/small.jpg");
-        assert_eq!(result.references[0].descriptor.as_deref(), Some("400w"));
-        assert_eq!(result.references[1].url, "img/large.jpg");
-        assert_eq!(result.references[1].descriptor.as_deref(), Some("800w"));
+        assert_eq!(s(&result.references[0].url), "img/small.jpg");
+        assert_eq!(result.references[0].descriptor, Some(SrcsetDescriptor::Width(400)));
+        assert_eq!(s(&result.references[1].url), "img/large.jpg");
+        assert_eq!(result.references[1].descriptor, Some(SrcsetDescriptor::Width(800)));
     }
 
     #[test]
@@ -877,8 +1016,8 @@ mod tests {
         let html = r#"<img srcset="local/a.jpg 1x, https://cdn.example.com/b.jpg 2x">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 2);
-        assert_eq!(result.references[0].url, "local/a.jpg");
-        assert_eq!(result.references[1].url, "https://cdn.example.com/b.jpg");
+        assert_eq!(s(&result.references[0].url), "local/a.jpg");
+        assert_eq!(s(&result.references[1].url), "https://cdn.example.com/b.jpg");
     }
 
     #[test]
@@ -902,8 +1041,8 @@ mod tests {
         let html = r#"<meta property="og:image" content="/img/hero.png">"#;
         let result = scan_file("test.html", html, &FxHashSet::default());
         assert_eq!(result.references.len(), 1);
-        assert_eq!(result.references[0].url, "/img/hero.png");
-        assert_eq!(result.references[0].tag, "meta");
+        assert_eq!(s(&result.references[0].url), "/img/hero.png");
+        assert_eq!(result.references[0].tag, MediaTag::Meta);
     }
 
     #[test]

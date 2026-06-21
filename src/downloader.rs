@@ -261,7 +261,7 @@ pub async fn download_and_rewrite(
                         let abs = root.join(&file_rel);
                         let file_refs: Vec<&crate::scanner::MediaReference> = all_refs
                             .iter()
-                            .filter(|r| r.file_path == file_rel)
+                            .filter(|r| &*r.file_path == file_rel.as_str())
                             .collect();
                         let url_map: FxHashMap<String, String> = urls
                             .iter()

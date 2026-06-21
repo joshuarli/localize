@@ -265,8 +265,8 @@ fn discover_and_index(
     include: &[String],
     exclude: &[String],
 ) -> (Vec<String>, FxHashSet<String>) {
-    let mut html_files = Vec::new();
-    let mut href_set = FxHashSet::default();
+    let mut html_files = Vec::with_capacity(4096);
+    let mut href_set = FxHashSet::with_capacity_and_hasher(16384, Default::default());
 
     let include_pats: Vec<glob::Pattern> = include
         .iter()
@@ -363,7 +363,7 @@ async fn scan_all(
         handles.push(handle);
     }
 
-    let mut all_refs = Vec::new();
+    let mut all_refs = Vec::with_capacity(files.len() * 4);
     for handle in handles {
         match handle.await {
             Ok((rel, result)) => {
@@ -444,11 +444,11 @@ fn print_json(refs: &[MediaReference]) {
             json_escape(kind),
             r.line,
             r.col,
-            json_escape(&r.tag),
-            json_escape(&r.attr),
+            json_escape(&r.tag.to_string()),
+            json_escape(&r.attr.to_string()),
         );
         if let Some(d) = &r.descriptor {
-            print!(",\"descriptor\":{}", json_escape(d));
+            print!(",\"descriptor\":{}", json_escape(&d.to_string()));
         } else {
             print!(",\"descriptor\":null");
         }
@@ -557,7 +557,7 @@ fn cmd_apply(args: Args) -> Result<(), String> {
         let mut urls = Vec::new();
         for r in &*refs {
             if seen.insert(&r.url) {
-                urls.push(r.url.clone());
+                urls.push(r.url.to_string());
             }
         }
         urls
@@ -600,9 +600,9 @@ fn cmd_apply(args: Args) -> Result<(), String> {
     let file_urls: FxHashMap<String, FxHashSet<String>> = {
         let mut map: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
         for r in &*refs {
-            map.entry(r.file_path.clone())
+            map.entry(r.file_path.to_string())
                 .or_default()
-                .insert(r.url.clone());
+                .insert(r.url.to_string());
         }
         map
     };

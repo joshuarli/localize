@@ -82,12 +82,12 @@ pub fn rewrite_file(
     sorted.sort_by_key(|r| std::cmp::Reverse(r.span.start));
 
     for r in &sorted {
-        if broken_urls.contains(&r.url) {
+        if broken_urls.contains(&*r.url) {
             if let Some(name_span) = find_attr_name_span(&content, r.span.start) {
                 let new_name = format!("data-broken-{}", &content[name_span.clone()]);
                 content.replace_range(name_span, &new_name);
             }
-        } else if let Some(local_rel) = url_map.get(&r.url) {
+        } else if let Some(local_rel) = url_map.get(&*r.url) {
             let rel_path = compute_relative_path(&r.file_path, local_rel);
             content.replace_range(r.span.start..r.span.end, &rel_path);
         }
