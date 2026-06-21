@@ -1103,6 +1103,41 @@ fn cmd_zap(args: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a URL from an HTML attribute against the HTML file's directory,
+/// producing a path relative to the scan root. Remote URLs and data URIs are
+/// returned as-is.
+fn resolve_html_url(html_rel: &str, url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return url.to_string();
+    }
+    let html_dir = Path::new(html_rel).parent().unwrap_or(Path::new(""));
+    let combined = html_dir.join(url);
+    let mut parts: Vec<&str> = Vec::new();
+    for c in combined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(p) => {
+                if let Some(s) = p.to_str() {
+                    parts.push(s);
+                }
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return ".".to_string();
+    }
+    parts.join("/")
+}
+
+/// Split a URL from an optional descriptor (e.g. "image.jpg 400w" → ("image.jpg", "400w")).
+fn split_url_descriptor(entry: &str) -> (&str, &str) {
+    entry.split_once(' ').unwrap_or((entry, ""))
+}
+
 fn cmd_towebp(args: Args) -> Result<(), String> {
     let root = args.root.as_deref().unwrap_or(".");
     let apply = args.apply;
@@ -1240,7 +1275,18 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
     for (rel, matches) in &file_results {
         println!("./{rel}");
         for m in matches {
-            println!("  {} {}: {} → {}", m.tag, m.attr, m.url, m.new_url);
+            let (old_url, old_desc) = split_url_descriptor(&m.url);
+            let (new_url, new_desc) = split_url_descriptor(&m.new_url);
+            let old_resolved = resolve_html_url(rel, old_url);
+            let new_resolved = resolve_html_url(rel, new_url);
+            if old_desc.is_empty() {
+                println!("  {} {}: {} → {}", m.tag, m.attr, old_resolved, new_resolved);
+            } else {
+                println!(
+                    "  {} {}: {} {} → {} {}",
+                    m.tag, m.attr, old_resolved, old_desc, new_resolved, new_desc
+                );
+            }
         }
         println!();
     }
