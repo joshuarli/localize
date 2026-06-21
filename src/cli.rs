@@ -17,13 +17,13 @@ struct Args {
     json: bool,
     verbose: bool,
     jobs: usize,
-    // apply-only
+    // check-remote --download
+    download: bool,
     timeout: u32,
     retries: u32,
     force: bool,
     user_agent: String,
     referer: String,
-    dry_run: bool,
     // zap
     zap_tag: Option<String>,
     zap_query: Option<String>,
@@ -41,12 +41,12 @@ impl Default for Args {
             json: false,
             verbose: false,
             jobs: 0,
+            download: false,
             timeout: 30,
             retries: 3,
             force: false,
             user_agent: String::new(),
             referer: String::new(),
-            dry_run: false,
             zap_tag: None,
             zap_query: None,
             apply: false,
@@ -62,31 +62,32 @@ localize — maintenance toolkit for static HTML sites.
 Usage: localize <command> [ROOT] [flags]
 
 Commands:
-  scan     Find remote media URLs in HTML files.
-  apply    Download remote assets and rewrite HTML to use local relative paths.
-  clean    Find and fix broken local links by unwrapping dead <a> tags and
-           removing dead resource elements.
-  zap      Remove HTML elements matching a CSS selector whose inner text
-           contains a query string. Dry-run by default, --apply to remove.
-  towebp   Replace .jpg/.jpeg/.png URL extensions with .webp in href, src,
-           and srcset attributes. Dry-run by default, --apply to rewrite.
+  check-remote  Find remote media URLs in HTML files.  With --download,
+                also fetch those assets and rewrite HTML to use local paths.
+  clean         Find and fix broken local links by unwrapping dead <a> tags
+                and removing dead resource elements.
+  zap           Remove HTML elements matching a CSS selector whose inner text
+                contains a query string. Dry-run by default, --apply to remove.
+  towebp        Replace .jpg/.jpeg/.png URL extensions with .webp in href,
+                src, and srcset attributes. Dry-run by default, --apply to
+                rewrite.
 
 Common flags:
   --include <pattern>   Only process files matching glob pattern (repeatable).
   --exclude <pattern>   Skip files matching glob pattern (repeatable).
   --assets-dir <dir>    Asset directory [default: assets/external].
-  --json                Output as JSON (scan, apply).
+  --json                Output as JSON.
   --verbose             Verbose progress output.
   --jobs <n>            Max parallel workers [default: CPUs × 4].
   --help, -h            Print this help and exit.
 
-Apply flags:
+Check-remote flags:
+  --download            Download assets and rewrite HTML (default is scan only).
   --timeout <s>         Download timeout in seconds [default: 30].
   --retries <n>         Download retry count [default: 3].
   --force               Re-download even if asset already exists.
   --user-agent <str>    Custom User-Agent header.
   --referer <str>       Custom Referer header.
-  --dry-run             Preview without downloading or rewriting.
 
 Clean flags:
   --force               Apply fixes (dry-run by default).
@@ -98,8 +99,8 @@ Towebp flags:
   --apply               Apply rewrites (dry-run by default).
 
 Examples:
-  localize scan ~/mysite
-  localize apply ~/mysite --dry-run
+  localize check-remote ~/mysite
+  localize check-remote ~/mysite --download
   localize clean ~/mysite --force
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply"
@@ -123,7 +124,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (scan, apply, clean, zap, or towebp)".into());
+                return Err("expected subcommand (check-remote, clean, zap, or towebp)".into());
             }
         }
     }
@@ -192,8 +193,8 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("referer") => {
                 args.referer = parser.value()?.string()?;
             }
-            Long("dry-run") => {
-                args.dry_run = true;
+            Long("download") => {
+                args.download = true;
             }
             Long("apply") => {
                 args.apply = true;
@@ -502,7 +503,7 @@ fn dedup_broken(refs: Vec<MediaReference>) -> Vec<MediaReference> {
     out
 }
 
-fn cmd_scan(args: Args) -> Result<(), String> {
+fn cmd_check_remote(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
 
     let root = args.root.as_ref().ok_or("missing root")?;
@@ -535,197 +536,141 @@ fn cmd_scan(args: Args) -> Result<(), String> {
 
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
     let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose, &href_set));
-
     let refs = dedup_broken(refs);
 
-    if args.json {
-        print_json(&refs);
-    } else {
-        print_human(&refs);
-    }
-
-    if args.verbose {
-        let unique_broken = refs.iter().filter(|r| r.broken).count();
-        let remote = refs.len() - unique_broken;
-        eprintln!(
-            "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
-            refs.len(),
-            files.len(),
-            unique_broken,
-            remote,
-        );
-    }
-
-    Ok(())
-}
-
-fn cmd_apply(args: Args) -> Result<(), String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
-
-    let root = args.root.as_ref().ok_or("missing root")?;
-    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
-    let include: &[String] = if args.include.is_empty() {
-        &default_include
-    } else {
-        &args.include
-    };
-    let jobs = if args.jobs == 0 {
-        num_cpus() * 4
-    } else {
-        args.jobs
-    };
-    let dl_jobs = if args.jobs == 0 { 8 } else { args.jobs };
-
-    eprintln!("Discovering HTML files in {root}...");
-    let files = iter_html_files(root, include, &args.exclude);
-
-    if args.verbose {
-        eprintln!("Found {} HTML file(s) to process", files.len());
-    }
-    if files.is_empty() {
-        eprintln!("No HTML files found.");
-        return Ok(());
-    }
-
-    // 1. Scan.
-    eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
-    let empty_set = FxHashSet::default();
-    let refs: Arc<[MediaReference]> = rt
-        .block_on(scan_all(root, &files, jobs, args.verbose, &empty_set))
-        .into();
-    if refs.is_empty() {
-        if args.verbose {
-            eprintln!("No external references found.");
+    if args.download {
+        // Filter to remote URLs (local broken URLs can't be downloaded).
+        let remote_refs: Vec<&MediaReference> = refs.iter().filter(|r| !r.broken).collect();
+        if remote_refs.is_empty() {
+            if args.verbose {
+                eprintln!("No remote references found.");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    // 2. Deduplicate URLs.
-    let unique_urls: Vec<String> = {
-        let mut seen = FxHashSet::default();
-        let mut urls = Vec::new();
-        for r in &*refs {
-            if seen.insert(&r.url) {
-                urls.push(r.url.to_string());
+        let unique_urls: Vec<String> = {
+            let mut seen = FxHashSet::default();
+            let mut urls = Vec::new();
+            for r in &remote_refs {
+                if seen.insert(&r.url) {
+                    urls.push(r.url.to_string());
+                }
+            }
+            urls
+        };
+
+        let new_urls: Vec<String> = if args.force {
+            unique_urls.clone()
+        } else {
+            unique_urls
+                .iter()
+                .filter(|u| {
+                    let rel = asset_path(u, &args.assets_dir);
+                    !Path::new(root).join(&rel).is_file()
+                })
+                .cloned()
+                .collect()
+        };
+
+        let file_urls: FxHashMap<String, FxHashSet<String>> = {
+            let mut map: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+            for r in &remote_refs {
+                map.entry(r.file_path.to_string())
+                    .or_default()
+                    .insert(r.url.to_string());
+            }
+            map
+        };
+        let total_files = file_urls.len();
+        eprintln!(
+            "Downloading {} asset(s) across {} file(s) ({} already present)...",
+            new_urls.len(),
+            total_files,
+            unique_urls.len() - new_urls.len()
+        );
+
+        let dl_jobs = if args.jobs == 0 { 8 } else { args.jobs };
+        let dl_cfg = DownloadConfig {
+            root: Path::new(root),
+            assets_dir: &args.assets_dir,
+            timeout: args.timeout,
+            retries: args.retries,
+            user_agent: &args.user_agent,
+            referer: &args.referer,
+            force: args.force,
+            verbose: args.verbose,
+            jobs: dl_jobs,
+        };
+        let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
+
+        if !broken_urls.is_empty() {
+            eprintln!(
+                "{} URL(s) returned 404 — attributes renamed to data-broken-*:",
+                broken_urls.len()
+            );
+            for u in broken_urls.iter().take(10) {
+                eprintln!("  {u}");
+            }
+            if broken_urls.len() > 10 {
+                eprintln!("  ... and {} more", broken_urls.len() - 10);
             }
         }
-        urls
-    };
 
-    let new_urls: Vec<String> = if args.force {
-        unique_urls.clone()
-    } else {
-        unique_urls
-            .iter()
-            .filter(|u| {
-                let rel = asset_path(u, &args.assets_dir);
-                !Path::new(root).join(&rel).is_file()
-            })
-            .cloned()
-            .collect()
-    };
+        let skipped: Vec<&String> = file_urls
+            .keys()
+            .filter(|f| !rewritten.contains(*f))
+            .collect();
+        if !skipped.is_empty() {
+            eprintln!(
+                "Skipped {} file(s) with transient failures (re-run to retry):",
+                skipped.len()
+            );
+            for f in &skipped {
+                eprintln!("  {f}");
+            }
+        }
 
-    // 3. Dry run: preview.
-    if args.dry_run {
-        println!("Would download {} asset(s):", new_urls.len());
-        for u in &new_urls {
-            println!("  {u} -> {}", asset_path(u, &args.assets_dir));
+        let rewritten_files: Vec<String> = rewritten.iter().cloned().collect();
+        let stray = verify_no_remote(&rewritten_files, root);
+        if !stray.is_empty() {
+            eprintln!(
+                "WARNING: {} file(s) still contain remote URLs:",
+                stray.len()
+            );
+            for s in &stray {
+                eprintln!("  {s}");
+            }
         }
-        let mut by_file: FxHashMap<&str, Vec<&MediaReference>> = FxHashMap::default();
-        for r in &*refs {
-            by_file.entry(&r.file_path).or_default().push(r);
-        }
-        println!("\nWould rewrite {} file(s):", by_file.len());
-        for f in by_file.keys() {
-            println!("  {f} ({} reference(s))", by_file[f].len());
-        }
+
         if args.json {
             print_json(&refs);
         }
-        return Ok(());
-    }
 
-    // 4. Download + rewrite: files are rewritten as soon as their URLs complete.
-    let file_urls: FxHashMap<String, FxHashSet<String>> = {
-        let mut map: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-        for r in &*refs {
-            map.entry(r.file_path.to_string())
-                .or_default()
-                .insert(r.url.to_string());
-        }
-        map
-    };
-    let total_files = file_urls.len();
-    eprintln!(
-        "Downloading {} asset(s) across {} file(s) ({} already present)...",
-        new_urls.len(),
-        total_files,
-        unique_urls.len() - new_urls.len()
-    );
-
-    let dl_cfg = DownloadConfig {
-        root: Path::new(root),
-        assets_dir: &args.assets_dir,
-        timeout: args.timeout,
-        retries: args.retries,
-        user_agent: &args.user_agent,
-        referer: &args.referer,
-        force: args.force,
-        verbose: args.verbose,
-        jobs: dl_jobs,
-    };
-    let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
-
-    if !broken_urls.is_empty() {
         eprintln!(
-            "{} URL(s) returned 404 — attributes renamed to data-broken-*:",
-            broken_urls.len()
-        );
-        for u in broken_urls.iter().take(10) {
-            eprintln!("  {u}");
-        }
-        if broken_urls.len() > 10 {
-            eprintln!("  ... and {} more", broken_urls.len() - 10);
-        }
-    }
-
-    let skipped: Vec<&String> = file_urls
-        .keys()
-        .filter(|f| !rewritten.contains(*f))
-        .collect();
-    if !skipped.is_empty() {
-        eprintln!(
-            "Skipped {} file(s) with transient failures (re-run to retry):",
+            "Done. {} unique URL(s), {} file(s) rewritten, {} skipped.",
+            unique_urls.len(),
+            rewritten.len(),
             skipped.len()
         );
-        for f in &skipped {
-            eprintln!("  {f}");
+    } else {
+        if args.json {
+            print_json(&refs);
+        } else {
+            print_human(&refs);
+        }
+
+        if args.verbose {
+            let unique_broken = refs.iter().filter(|r| r.broken).count();
+            let remote = refs.len() - unique_broken;
+            eprintln!(
+                "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
+                refs.len(),
+                files.len(),
+                unique_broken,
+                remote,
+            );
         }
     }
-
-    // 5. Verify rewritten files.
-    let rewritten_files: Vec<String> = rewritten.iter().cloned().collect();
-    let stray = verify_no_remote(&rewritten_files, root);
-    if !stray.is_empty() {
-        eprintln!(
-            "WARNING: {} file(s) still contain remote URLs:",
-            stray.len()
-        );
-        for s in &stray {
-            eprintln!("  {s}");
-        }
-    }
-
-    if args.json {
-        print_json(&refs);
-    }
-
-    eprintln!(
-        "Done. {} unique URL(s), {} file(s) rewritten, {} skipped.",
-        unique_urls.len(),
-        rewritten.len(),
-        skipped.len()
-    );
 
     Ok(())
 }
@@ -1675,27 +1620,26 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
     };
 
     let result = match args.command.as_deref() {
-        Some("scan") => cmd_scan(args),
-        Some("apply") => cmd_apply(args),
+        Some("check-remote") => cmd_check_remote(args),
         Some("clean") => cmd_clean(args),
         Some("zap") => cmd_zap(args),
         Some("towebp") => cmd_towebp(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
             eprintln!("localize: expected subcommand (scan, apply, clean, zap, or towebp)");
-            eprintln!("Usage: localize <scan|apply|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
