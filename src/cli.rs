@@ -460,6 +460,48 @@ fn print_json(refs: &[MediaReference]) {
     println!("]");
 }
 
+/// Resolve a relative URL against a file's parent directory, normalizing `..` and `.`.
+fn resolve_relative(file_path: &str, url: &str) -> String {
+    let dir = std::path::Path::new(file_path)
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let combined = if dir.is_empty() {
+        url.to_string()
+    } else {
+        format!("{dir}/{url}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in combined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// Deduplicate broken-local-url entries by resolved path, keeping the first occurrence.
+fn dedup_broken(refs: Vec<MediaReference>) -> Vec<MediaReference> {
+    let mut seen = FxHashSet::default();
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        if r.broken {
+            let resolved = resolve_relative(&r.file_path, &r.url);
+            if seen.insert(resolved) {
+                out.push(r);
+            }
+        } else {
+            out.push(r);
+        }
+    }
+    out
+}
+
 fn cmd_scan(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
 
@@ -494,20 +536,23 @@ fn cmd_scan(args: Args) -> Result<(), String> {
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
     let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose, &href_set));
 
+    let refs = dedup_broken(refs);
+
     if args.json {
         print_json(&refs);
     } else {
         print_human(&refs);
     }
 
-    let broken_count = refs.iter().filter(|r| r.broken).count();
     if args.verbose {
+        let unique_broken = refs.iter().filter(|r| r.broken).count();
+        let remote = refs.len() - unique_broken;
         eprintln!(
-            "\nTotal: {} reference(s) in {} file(s) ({} local broken, {} remote)",
+            "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
             refs.len(),
             files.len(),
-            broken_count,
-            refs.len() - broken_count,
+            unique_broken,
+            remote,
         );
     }
 
