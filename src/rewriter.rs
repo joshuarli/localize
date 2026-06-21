@@ -167,7 +167,7 @@ mod tests {
         let html = r#"<img src="https://cdn.example.com/logo.png">"#;
         std::fs::write(&file_path, html).unwrap();
 
-        let refs = crate::scanner::scan_file("test.html", html).references;
+        let refs = crate::scanner::scan_file("test.html", html, &FxHashSet::default()).references;
         assert_eq!(refs.len(), 1);
         let refs: Vec<&MediaReference> = refs.iter().collect();
 
@@ -191,7 +191,7 @@ mod tests {
         let html = r#"<img srcset="https://a.com/s.jpg 400w, https://a.com/l.jpg 800w">"#;
         std::fs::write(&file_path, html).unwrap();
 
-        let refs = crate::scanner::scan_file("test.html", html).references;
+        let refs = crate::scanner::scan_file("test.html", html, &FxHashSet::default()).references;
         assert_eq!(refs.len(), 2);
         let refs: Vec<&MediaReference> = refs.iter().collect();
 
@@ -214,7 +214,7 @@ mod tests {
         let html = r#"<a href="https://s3.example.com/missing.jpg"><img src="local.jpg"></a>"#;
         std::fs::write(&file_path, html).unwrap();
 
-        let refs = crate::scanner::scan_file("test.html", html).references;
+        let refs = crate::scanner::scan_file("test.html", html, &FxHashSet::default()).references;
         // Remote <a href> + local <img src> now both captured.
         assert_eq!(refs.len(), 2);
         let refs: Vec<&MediaReference> = refs.iter().collect();
@@ -243,7 +243,7 @@ mod tests {
         let html = r#"<img src="https://cdn.example.com/gone.png" alt="x">"#;
         std::fs::write(&file_path, html).unwrap();
 
-        let refs = crate::scanner::scan_file("test.html", html).references;
+        let refs = crate::scanner::scan_file("test.html", html, &FxHashSet::default()).references;
         assert_eq!(refs.len(), 1);
         let refs: Vec<&MediaReference> = refs.iter().collect();
 

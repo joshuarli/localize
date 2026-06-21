@@ -1,4 +1,3 @@
-use crate::clean::resolve_href;
 use crate::downloader::{DownloadConfig, asset_path, download_and_rewrite};
 use crate::scanner::{MediaReference, is_remote_url, scan_file};
 use lexopt::prelude::*;
@@ -247,11 +246,9 @@ fn iter_html_files(root: &str, include: &[String], exclude: &[String]) -> Vec<St
         let rel = full.strip_prefix(root).unwrap_or(full);
         let rel_str = rel.to_string_lossy();
 
-        // Check exclude patterns first.
         if exclude_pats.iter().any(|p| p.matches(&rel_str)) {
             continue;
         }
-        // Check include patterns.
         if include_pats.iter().any(|p| p.matches(&rel_str)) {
             matches.push(rel_str.to_string());
         }
@@ -261,7 +258,75 @@ fn iter_html_files(root: &str, include: &[String], exclude: &[String]) -> Vec<St
     matches
 }
 
-async fn scan_all(root: &str, files: &[String], jobs: usize, verbose: bool) -> Vec<MediaReference> {
+/// Walk the tree once, collecting HTML file paths and building the canonical
+/// href set for existence checks. Returns (html_files, href_set).
+fn discover_and_index(
+    root: &str,
+    include: &[String],
+    exclude: &[String],
+) -> (Vec<String>, FxHashSet<String>) {
+    let mut html_files = Vec::new();
+    let mut href_set = FxHashSet::default();
+
+    let include_pats: Vec<glob::Pattern> = include
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    let exclude_pats: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+
+    for entry in jwalk::WalkDir::new(root)
+        .skip_hidden(false)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let full = entry.path();
+        let rel = full.strip_prefix(root).unwrap_or(&full);
+        let rel_lossy = rel.to_string_lossy();
+        let rel_str: &str = &rel_lossy;
+
+        if exclude_pats.iter().any(|p| p.matches(rel_str)) {
+            continue;
+        }
+
+        // Build canonical href for every file.
+        let href = if rel_str.ends_with("/index.html") || rel_str.ends_with("/index.htm") {
+            match rel_str.rfind('/') {
+                Some(pos) => &rel_str[..pos],
+                None => "",
+            }
+        } else if rel_str == "index.html" || rel_str == "index.htm" {
+            ""
+        } else {
+            rel_str
+        };
+        href_set.insert(href.to_string());
+
+        // Collect HTML files matching include patterns.
+        if include_pats.iter().any(|p| p.matches(rel_str)) {
+            html_files.push(rel_str.to_string());
+        }
+    }
+
+    html_files.sort();
+    (html_files, href_set)
+}
+
+async fn scan_all(
+    root: &str,
+    files: &[String],
+    jobs: usize,
+    verbose: bool,
+    href_set: &FxHashSet<String>,
+) -> Vec<MediaReference> {
     if files.is_empty() {
         return Vec::new();
     }
@@ -271,20 +336,22 @@ async fn scan_all(root: &str, files: &[String], jobs: usize, verbose: bool) -> V
     let total = files.len();
 
     let root = Arc::new(root.to_string());
+    let href_set = Arc::new(href_set.clone());
     let mut handles = Vec::with_capacity(files.len());
     for rel in files {
         let rel = rel.clone();
         let root = root.clone();
         let sem = sem.clone();
         let counter = counter.clone();
+        let href_set = href_set.clone();
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             tokio::task::spawn_blocking(move || {
                 let path = Path::new(root.as_str()).join(&rel);
                 let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let result = scan_file(&rel, &content);
+                let result = scan_file(&rel, &content, &href_set);
                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if !verbose {
+                if !verbose && done.is_multiple_of(16) {
                     eprint!("\rScanning: {done}/{total} files");
                     let _ = std::io::stderr().flush();
                 }
@@ -393,42 +460,6 @@ fn print_json(refs: &[MediaReference]) {
     println!("]");
 }
 
-/// Compute the canonical href for an HTML file, matching clean::scan_file's logic.
-fn doc_canonical_href(file_path: &str) -> (String, bool) {
-    let normalized = file_path.replace('\\', "/");
-    if normalized.ends_with("/index.html") || normalized.ends_with("/index.htm") {
-        match normalized.rfind('/') {
-            Some(pos) => (normalized[..pos].to_string(), true),
-            None => (String::new(), true),
-        }
-    } else if normalized == "index.html" || normalized == "index.htm" {
-        (String::new(), true)
-    } else {
-        (normalized, false)
-    }
-}
-
-/// For each local MediaReference, resolve the href and check whether the file
-/// exists in the pre-built href set. Sets `broken = true` when the file is missing.
-fn check_local_urls(refs: &mut [MediaReference], href_set: &FxHashSet<String>) {
-    let mut scratch = String::new();
-    let mut decode_buf = String::new();
-    for r in refs.iter_mut() {
-        if is_remote_url(&r.url) {
-            continue;
-        }
-        let (doc_href, doc_is_index) = doc_canonical_href(&r.file_path);
-        let resolved = resolve_href(
-            &doc_href,
-            doc_is_index,
-            &r.url,
-            &mut scratch,
-            &mut decode_buf,
-        );
-        r.broken = !href_set.contains(resolved);
-    }
-}
-
 fn cmd_scan(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
 
@@ -445,27 +476,19 @@ fn cmd_scan(args: Args) -> Result<(), String> {
         args.jobs
     };
 
-    eprintln!("Discovering HTML files in {root}...");
-    let files = iter_html_files(root, include, &args.exclude);
+    eprintln!("Discovering files in {root}...");
+    let (files, href_set) = discover_and_index(root, include, &args.exclude);
 
     if args.verbose {
-        eprintln!("Found {} HTML file(s) to scan", files.len());
+        eprintln!("Found {} HTML file(s), {} total file(s)", files.len(), href_set.len());
     }
     if files.is_empty() {
         eprintln!("No HTML files found.");
         return Ok(());
     }
 
-    eprintln!("Building file index...");
-    let href_set = crate::clean::build_href_set(Path::new(root));
-    if args.verbose {
-        eprintln!("Indexed {} file(s)", href_set.len());
-    }
-
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
-    let mut refs = rt.block_on(scan_all(root, &files, jobs, args.verbose));
-
-    check_local_urls(&mut refs, &href_set);
+    let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose, &href_set));
 
     if args.json {
         print_json(&refs);
@@ -517,8 +540,9 @@ fn cmd_apply(args: Args) -> Result<(), String> {
 
     // 1. Scan.
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
+    let empty_set = FxHashSet::default();
     let refs: Arc<[MediaReference]> = rt
-        .block_on(scan_all(root, &files, jobs, args.verbose))
+        .block_on(scan_all(root, &files, jobs, args.verbose, &empty_set))
         .into();
     if refs.is_empty() {
         if args.verbose {
@@ -666,7 +690,8 @@ fn verify_no_remote(files: &[String], root: &str) -> Vec<String> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let result = scan_file(rel, &content);
+        let empty_set = FxHashSet::default();
+        let result = scan_file(rel, &content, &empty_set);
         if !result.references.is_empty() {
             stray.push(rel.clone());
         }
@@ -738,7 +763,7 @@ fn cmd_clean(args: Args) -> Result<(), String> {
                     let result = crate::clean::clean_file(&path, &root_path, &href_set, !force);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        eprint!("\rScanning: {done}/{file_total} files");
+                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
                         let _ = std::io::stderr().flush();
                     }
                     (rel.clone(), result)
@@ -891,7 +916,7 @@ fn cmd_zap(args: Args) -> Result<(), String> {
                     let result = crate::zap::zap_file(&path, &selector, &query, !apply);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        eprint!("\rScanning: {done}/{file_total} files");
+                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
                         let _ = std::io::stderr().flush();
                     }
                     (rel.clone(), result)
@@ -1028,7 +1053,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                     let result = crate::towebp::towebp_file(&path, !apply);
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        eprint!("\rScanning: {done}/{file_total} files");
+                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
                         let _ = std::io::stderr().flush();
                     }
                     (rel.clone(), result)
