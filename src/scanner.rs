@@ -364,7 +364,14 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
     let mut is_broken = |url: &str| -> bool {
         let resolved =
             crate::clean::resolve_href(&doc_href, doc_is_index, url, &mut scratch, &mut decode_buf);
-        !href_set.contains(resolved)
+        if href_set.contains(resolved) {
+            return false;
+        }
+        // Fall back to raw resolution (no percent-decode). Some tools (grab)
+        // save files with percent-encoded names, so the decoded check fails
+        // even though the file exists.
+        let raw = crate::clean::resolve_href_raw(&doc_href, doc_is_index, url, &mut scratch);
+        !href_set.contains(raw)
     };
 
     let tokenizer = Tokenizer::new_with_emitter(html, DefaultEmitter::<usize>::new_with_span());
@@ -1263,5 +1270,30 @@ mod tests {
         assert_eq!(result.references.len(), 1);
         assert_eq!(s(&result.references[0].url), "//cdn.example.com/logo.png");
         assert!(!result.references[0].broken);
+    }
+
+    #[test]
+    fn test_percent_encoded_filename_matches_disk() {
+        // Regression: grab saves files with percent-encoded names (literal %XX
+        // bytes on disk). resolve_href percent-decodes the URL, so the decoded
+        // path won't match the encoded filename. The raw fallback must find it.
+        let mut set = FxHashSet::default();
+        set.insert(
+            "_grab/example.com/photos/kane_-%E5%85%BC_-test.jpg".to_string(),
+        );
+        let html = r#"<img src="../../_grab/example.com/photos/kane_-%E5%85%BC_-test.jpg">"#;
+        let result = scan_file("posts/some-post/index.html", html, &set);
+        assert_eq!(result.references.len(), 0, "should find file via raw fallback");
+    }
+
+    #[test]
+    fn test_percent_encoded_filename_truly_missing() {
+        // When neither the decoded nor raw path exists, it should be broken.
+        let mut set = FxHashSet::default();
+        set.insert("_grab/example.com/photos/some-other-file.jpg".to_string());
+        let html = r#"<img src="../../_grab/example.com/photos/missing_kane_-%E5%85%BC_-test.jpg">"#;
+        let result = scan_file("posts/some-post/index.html", html, &set);
+        assert_eq!(result.references.len(), 1);
+        assert!(result.references[0].broken);
     }
 }

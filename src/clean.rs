@@ -198,6 +198,74 @@ pub(crate) fn resolve_href<'a>(
     scratch
 }
 
+/// Like `resolve_href` but does NOT percent-decode the URL path.
+/// This is the fallback for filesystems where filenames were written with
+/// percent-encoded bytes (e.g. `grab` preserves URL encoding on disk).
+pub(crate) fn resolve_href_raw<'a>(
+    doc_href: &str,
+    doc_is_index: bool,
+    raw_href: &str,
+    scratch: &'a mut String,
+) -> &'a str {
+    let trimmed = raw_href.trim();
+
+    let qs = trimmed.find(&['?', '#'][..]).unwrap_or(trimmed.len());
+    let raw_path = &trimmed[..qs];
+
+    scratch.clear();
+
+    if is_external_link(raw_path) {
+        scratch.push_str(raw_path);
+        return scratch;
+    }
+    if let Some(stripped) = raw_path.strip_prefix('/') {
+        scratch.push_str(stripped);
+        return scratch;
+    }
+
+    scratch.push_str(doc_href);
+    if doc_is_index {
+        scratch.push('/');
+    }
+
+    if raw_path.is_empty() {
+        if scratch.ends_with('/') {
+            scratch.pop();
+        }
+        return scratch;
+    }
+
+    if let Some(pos) = scratch.rfind('/') {
+        scratch.truncate(pos);
+    } else {
+        scratch.clear();
+    }
+
+    let mut components = raw_path.split('/').peekable();
+    while let Some(comp) = components.next() {
+        let is_last = components.peek().is_none();
+        match comp {
+            "index.html" | "index.htm" if is_last => {}
+            "" | "." => {}
+            ".." => {
+                if let Some(pos) = scratch.rfind('/') {
+                    scratch.truncate(pos);
+                } else {
+                    scratch.clear();
+                }
+            }
+            _ => {
+                if !scratch.is_empty() {
+                    scratch.push('/');
+                }
+                scratch.push_str(comp);
+            }
+        }
+    }
+
+    scratch
+}
+
 fn tag_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
     match tag {
         b"a" | b"area" | b"link" => Some(&["href"]),
