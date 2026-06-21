@@ -3,7 +3,6 @@ use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
 use rustc_hash::FxHashSet;
 use std::ops::Range;
-use std::path::Path;
 use std::sync::LazyLock;
 
 static VOID_ELEMENTS: LazyLock<FxHashSet<&'static [u8]>> = LazyLock::new(|| {
@@ -329,41 +328,6 @@ fn text_preview(s: &str, max_len: usize) -> String {
     format!("{}...", &s[..end])
 }
 
-/// Zap matching elements from a single HTML file.
-/// If `dry_run` is true, only scan (no modification).
-pub fn zap_file(
-    path: &Path,
-    selector: &SimpleSelector,
-    query: &str,
-    dry_run: bool,
-) -> Result<ZapResult, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-
-    let result = scan_html(&content, selector, query);
-    if let Some(err) = &result.error {
-        return Err(format!("{}: {err}", path.display()));
-    }
-
-    if result.matches.is_empty() || dry_run {
-        return Ok(result);
-    }
-
-    let mut modified = content.clone();
-    // Sort descending so earlier removals don't shift later spans.
-    let mut sorted: Vec<&ZapMatch> = result.matches.iter().collect();
-    sorted.sort_by_key(|m| std::cmp::Reverse(m.span.start));
-    for m in &sorted {
-        modified.replace_range(m.span.clone(), "");
-    }
-
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &modified).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,47 +614,11 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_removal() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(&path, "before<p>target</p>after").unwrap();
-        let result = zap_file(&path, &sel("p"), "target", false).unwrap();
-        assert!(result.error.is_none());
-        assert_eq!(result.matches.len(), 1);
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "beforeafter");
-    }
-
-    #[test]
-    fn test_apply_multiple() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(&path, "<p>a</p><p>b</p><p>c</p>").unwrap();
-        let result = zap_file(&path, &sel("p"), "b", false).unwrap();
-        assert!(result.error.is_none());
-        assert_eq!(result.matches.len(), 1);
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "<p>a</p><p>c</p>");
-    }
-
-    #[test]
     fn test_query_in_attribute_not_inner() {
         let html = r#"<p class="Digitalfire">text</p>"#;
         let result = scan_html(html, &sel("p"), "Digitalfire");
         assert!(result.error.is_none());
         assert_eq!(result.matches.len(), 0);
-    }
-
-    #[test]
-    fn test_dry_run_does_not_modify() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(&path, "<p>remove me</p>").unwrap();
-        let result = zap_file(&path, &sel("p"), "remove", true).unwrap();
-        assert!(result.error.is_none());
-        assert_eq!(result.matches.len(), 1);
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "<p>remove me</p>");
     }
 
     #[test]
@@ -701,24 +629,5 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         assert!(result.matches[0].text_preview.ends_with("..."));
         assert!(result.matches[0].text_preview.len() < long.len());
-    }
-
-    #[test]
-    fn test_multiple_files_no_cross_contamination() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let p1 = tmpdir.path().join("a.html");
-        let p2 = tmpdir.path().join("b.html");
-        std::fs::write(&p1, "<p>keep</p>").unwrap();
-        std::fs::write(&p2, "<p>zap this</p>").unwrap();
-
-        let r1 = zap_file(&p1, &sel("p"), "zap", false).unwrap();
-        let r2 = zap_file(&p2, &sel("p"), "zap", false).unwrap();
-        assert_eq!(r1.matches.len(), 0);
-        assert_eq!(r2.matches.len(), 1);
-
-        let a = std::fs::read_to_string(&p1).unwrap();
-        let b = std::fs::read_to_string(&p2).unwrap();
-        assert_eq!(a, "<p>keep</p>");
-        assert_eq!(b, "");
     }
 }

@@ -1,32 +1,7 @@
 use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
 use rustc_hash::FxHashSet;
-use std::ops::Range;
 use std::path::Path;
-use std::sync::LazyLock;
-
-static VOID_ELEMENTS: LazyLock<FxHashSet<&'static [u8]>> = LazyLock::new(|| {
-    let mut set = FxHashSet::default();
-    for e in [
-        b"area" as &[u8],
-        b"base",
-        b"br",
-        b"col",
-        b"embed",
-        b"hr",
-        b"img",
-        b"input",
-        b"link",
-        b"meta",
-        b"param",
-        b"source",
-        b"track",
-        b"wbr",
-    ] {
-        set.insert(e);
-    }
-    set
-});
 
 #[derive(Debug, Clone)]
 pub struct BrokenLink {
@@ -34,12 +9,7 @@ pub struct BrokenLink {
     pub tag: String,
     pub attr: String,
     #[allow(dead_code)]
-    pub url_span: Range<usize>,
-    pub tag_span: Range<usize>,
-    #[allow(dead_code)]
     pub line: usize,
-    #[allow(dead_code)]
-    pub action: &'static str,
 }
 
 #[derive(Debug)]
@@ -106,7 +76,7 @@ fn is_external_link(url: &str) -> bool {
 }
 
 /// Returns true if the URL is a local link we should check (not external, not empty).
-fn is_local_link(url: &str) -> bool {
+pub(crate) fn is_local_link(url: &str) -> bool {
     if url.is_empty() {
         return false;
     }
@@ -238,31 +208,9 @@ fn tag_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
     }
 }
 
-fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Range<usize> {
-    // Fast path: literal match.
-    if let Some(offset) = raw.find(value) {
-        let start = attr_start + offset;
-        return start..start + value.len();
-    }
-    // HTML entity in query string: &amp; is the decoded &.
-    if value.contains('&') {
-        let substituted = value.replace('&', "&amp;");
-        if let Some(offset) = raw.find(&substituted) {
-            let start = attr_start + offset;
-            return start..start + substituted.len();
-        }
-    }
-    // Fallback: return a zero-length span at the attribute start.
-    attr_start..attr_start
-}
-
 fn line_of_offset(source: &str, offset: usize) -> usize {
     let prefix = &source[..offset.min(source.len())];
     prefix.bytes().filter(|&b| b == b'\n').count() + 1
-}
-
-fn span_to_range(start: usize, end: usize) -> Range<usize> {
-    start..end
 }
 
 /// Parse the HTML and find all broken local links.
@@ -318,7 +266,6 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
                 }
                 let attr_value = std::str::from_utf8(&attr[..]).unwrap_or("");
                 let trimmed = attr_value.trim();
-                let raw = &html[attr.span.start..attr.span.end];
 
                 if attr_name == "srcset" {
                     for (url_str, _descriptor) in parse_srcset_entries(attr_value) {
@@ -332,18 +279,13 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
                                 &mut decode_buf,
                             );
                             if !href_set.contains(resolved) {
-                                let url_span = find_value_in_attr(raw, attr.span.start, &url_str);
-                                let action = action_for_tag(tag_name);
                                 broken.push(BrokenLink {
                                     url: url_str.to_string(),
                                     tag: std::str::from_utf8(tag_name)
                                         .unwrap_or("")
                                         .to_ascii_lowercase(),
                                     attr: "srcset".into(),
-                                    url_span,
-                                    tag_span: span_to_range(tag.span.start, tag.span.end),
                                     line: line_of_offset(html, tag.span.start),
-                                    action,
                                 });
                             }
                         }
@@ -357,18 +299,13 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
                         &mut decode_buf,
                     );
                     if !href_set.contains(resolved) {
-                        let url_span = find_value_in_attr(raw, attr.span.start, attr_value);
-                        let action = action_for_tag(tag_name);
                         broken.push(BrokenLink {
                             url: attr_value.to_string(),
                             tag: std::str::from_utf8(tag_name)
                                 .unwrap_or("")
                                 .to_ascii_lowercase(),
                             attr: attr_name.to_string(),
-                            url_span,
-                            tag_span: span_to_range(tag.span.start, tag.span.end),
                             line: line_of_offset(html, tag.span.start),
-                            action,
                         });
                     }
                 }
@@ -380,17 +317,6 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
         broken_links: broken,
         error: None,
     }
-}
-
-fn action_for_tag(tag: &[u8]) -> &'static str {
-    match tag {
-        b"a" | b"video" | b"audio" | b"object" | b"iframe" => "unwrap",
-        _ => "remove",
-    }
-}
-
-fn is_void(tag: &[u8]) -> bool {
-    VOID_ELEMENTS.contains(tag)
 }
 
 fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
@@ -413,167 +339,6 @@ fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
         entries.push((url.to_string(), descriptor));
     }
     entries
-}
-
-#[derive(Debug)]
-pub struct RemovalOp {
-    pub span: Range<usize>,
-    #[allow(dead_code)]
-    pub description: String,
-}
-
-pub fn plan_removals(html: &str, broken_links: &[BrokenLink]) -> Vec<RemovalOp> {
-    if broken_links.is_empty() {
-        return Vec::new();
-    }
-
-    let mut removals: Vec<RemovalOp> = Vec::new();
-
-    struct OpenEl {
-        name: Vec<u8>,
-        broken: bool,
-        start_tag_end: usize,
-        action: &'static str,
-    }
-    let mut stack: Vec<OpenEl> = Vec::new();
-    let mut pending_broken_a: Option<usize> = None;
-
-    let tokenizer = Tokenizer::new_with_emitter(html, DefaultEmitter::<usize>::new_with_span());
-
-    for token_result in tokenizer {
-        let token = match token_result {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        match token {
-            html5gum::Token::StartTag(tag) => {
-                let tag_name = &tag.name[..];
-                let is_self_closing = tag.self_closing;
-
-                let broken_entry = broken_links
-                    .iter()
-                    .find(|b| b.tag_span.start == tag.span.start);
-
-                if let Some(b) = broken_entry {
-                    removals.push(RemovalOp {
-                        span: span_to_range(tag.span.start, tag.span.end),
-                        description: format!(
-                            "remove <{}> start tag (broken {} link to {})",
-                            b.tag, b.attr, b.url
-                        ),
-                    });
-
-                    if is_self_closing || is_void(tag_name) {
-                    } else if tag_name == b"a" {
-                        pending_broken_a = Some(tag.span.start);
-                    } else if tag_name == b"script" {
-                        stack.push(OpenEl {
-                            name: tag_name.to_vec(),
-                            broken: true,
-                            start_tag_end: tag.span.end,
-                            action: "remove",
-                        });
-                    } else {
-                        stack.push(OpenEl {
-                            name: tag_name.to_vec(),
-                            broken: true,
-                            start_tag_end: tag.span.end,
-                            action: "unwrap",
-                        });
-                    }
-                }
-            }
-            html5gum::Token::EndTag(tag) => {
-                let tag_name = &tag.name[..];
-
-                if tag_name == b"a"
-                    && let Some(start_pos) = pending_broken_a.take()
-                    && broken_links
-                        .iter()
-                        .any(|b| b.tag == "a" && b.tag_span.start == start_pos)
-                {
-                    removals.push(RemovalOp {
-                        span: span_to_range(tag.span.start, tag.span.end),
-                        description: "remove </a> end tag (broken link)".into(),
-                    });
-                }
-
-                let mut pop_idx: Option<usize> = None;
-                for i in (0..stack.len()).rev() {
-                    if stack[i].name == tag_name {
-                        pop_idx = Some(i);
-                        break;
-                    }
-                }
-
-                if let Some(idx) = pop_idx {
-                    let open = &stack[idx];
-                    if open.broken {
-                        if open.action == "remove" {
-                            removals.push(RemovalOp {
-                                span: open.start_tag_end..tag.span.end,
-                                description: format!(
-                                    "remove <{}> body and </{}> (broken src)",
-                                    String::from_utf8_lossy(&open.name),
-                                    String::from_utf8_lossy(&open.name)
-                                ),
-                            });
-                        } else {
-                            removals.push(RemovalOp {
-                                span: span_to_range(tag.span.start, tag.span.end),
-                                description: format!(
-                                    "remove </{}> end tag (broken link)",
-                                    String::from_utf8_lossy(&open.name)
-                                ),
-                            });
-                        }
-                    }
-                    stack.truncate(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    removals.sort_by_key(|r| std::cmp::Reverse(r.span.start));
-    removals
-}
-
-fn apply_removals(content: &mut String, removals: &[RemovalOp]) {
-    for r in removals {
-        content.replace_range(r.span.clone(), "");
-    }
-}
-
-/// Clean a single HTML file. Returns the scan result (broken links found).
-pub fn clean_file(
-    path: &Path,
-    root: &Path,
-    href_set: &FxHashSet<String>,
-    dry_run: bool,
-) -> Result<CleanResult, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let rel_str = rel.to_string_lossy().to_string();
-
-    let result = scan_file(&rel_str, &content, href_set);
-    if let Some(err) = &result.error {
-        return Err(format!("{}: {err}", path.display()));
-    }
-
-    if !result.broken_links.is_empty() && !dry_run {
-        let removals = plan_removals(&content, &result.broken_links);
-        let mut modified = content.clone();
-        apply_removals(&mut modified, &removals);
-
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &modified).map_err(|e| format!("write tmp: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -842,7 +607,6 @@ mod tests {
         assert_eq!(b.tag, "a");
         assert_eq!(b.attr, "href");
         assert_eq!(b.url, "../picture/926.html");
-        assert_eq!(b.action, "unwrap");
     }
 
     #[test]
@@ -857,7 +621,6 @@ mod tests {
         assert_eq!(result.broken_links.len(), 1);
         let b = &result.broken_links[0];
         assert_eq!(b.tag, "img");
-        assert_eq!(b.action, "remove");
     }
 
     #[test]
@@ -908,75 +671,5 @@ mod tests {
         let html = r#"<a href="../glossary/">Glossary</a>"#;
         let result = scan_file("material/test.html", html, &set);
         assert_eq!(result.broken_links.len(), 0);
-    }
-
-    #[test]
-    fn test_plan_removals_unwrap_a() {
-        let html = r#"<p><a href="../broken.html">click <b>here</b></a></p>"#;
-        // Use empty set so all links are broken
-        let set = FxHashSet::default();
-        let result = scan_file("test.html", html, &set);
-
-        let removals = plan_removals(html, &result.broken_links);
-        assert_eq!(removals.len(), 2);
-
-        let mut modified = html.to_string();
-        apply_removals(&mut modified, &removals);
-        assert_eq!(modified, "<p>click <b>here</b></p>");
-    }
-
-    #[test]
-    fn test_plan_removals_remove_img() {
-        let html = r#"<div><img src="broken.jpg" alt="x"></div>"#;
-        let set = FxHashSet::default();
-        let result = scan_file("test.html", html, &set);
-
-        let removals = plan_removals(html, &result.broken_links);
-        assert_eq!(removals.len(), 1);
-
-        let mut modified = html.to_string();
-        apply_removals(&mut modified, &removals);
-        assert_eq!(modified, "<div></div>");
-    }
-
-    #[test]
-    fn test_plan_removals_script_src_broken() {
-        let html = r#"<script src="broken.js"></script>"#;
-        let set = FxHashSet::default();
-        let result = scan_file("test.html", html, &set);
-
-        let removals = plan_removals(html, &result.broken_links);
-        assert_eq!(result.broken_links.len(), 1);
-        assert_eq!(result.broken_links[0].tag, "script");
-
-        let mut modified = html.to_string();
-        apply_removals(&mut modified, &removals);
-        assert_eq!(modified.trim(), "");
-    }
-
-    #[test]
-    fn test_plan_removals_multiple_broken() {
-        let html = concat!(
-            r#"<a href="../broken.html"><img src="broken.jpg"></a>"#,
-            r#"<a href="also-broken.html">text</a>"#,
-        );
-        let set = FxHashSet::default();
-        let result = scan_file("test.html", html, &set);
-
-        let removals = plan_removals(html, &result.broken_links);
-        let mut modified = html.to_string();
-        apply_removals(&mut modified, &removals);
-        assert!(!modified.contains("<a "));
-        assert!(!modified.contains("</a>"));
-        assert!(!modified.contains("<img "));
-        assert!(modified.contains("text"));
-    }
-
-    #[test]
-    fn test_line_of_offset() {
-        let source = "line1\nline2\nline3\nline4";
-        assert_eq!(line_of_offset(source, 0), 1);
-        assert_eq!(line_of_offset(source, 6), 2);
-        assert_eq!(line_of_offset(source, 12), 3);
     }
 }

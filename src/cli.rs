@@ -277,10 +277,7 @@ fn discover_and_index(
         .filter_map(|p| glob::Pattern::new(p).ok())
         .collect();
 
-    for entry in jwalk::WalkDir::new(root)
-        .skip_hidden(false)
-        .into_iter()
-    {
+    for entry in jwalk::WalkDir::new(root).skip_hidden(false).into_iter() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -399,7 +396,10 @@ fn print_human(refs: &[MediaReference]) {
             "remote-url"
         };
         if let Some(ref desc) = r.descriptor {
-            println!("{kind}: ./{}:{}:{}  {}  {desc}", r.file_path, r.line, r.col, r.url);
+            println!(
+                "{kind}: ./{}:{}:{}  {}  {desc}",
+                r.file_path, r.line, r.col, r.url
+            );
         } else {
             println!("{kind}: ./{}:{}:{}  {}", r.file_path, r.line, r.col, r.url);
         }
@@ -480,7 +480,11 @@ fn cmd_scan(args: Args) -> Result<(), String> {
     let (files, href_set) = discover_and_index(root, include, &args.exclude);
 
     if args.verbose {
-        eprintln!("Found {} HTML file(s), {} total file(s)", files.len(), href_set.len());
+        eprintln!(
+            "Found {} HTML file(s), {} total file(s)",
+            files.len(),
+            href_set.len()
+        );
     }
     if files.is_empty() {
         eprintln!("No HTML files found.");
@@ -625,8 +629,7 @@ fn cmd_apply(args: Args) -> Result<(), String> {
         verbose: args.verbose,
         jobs: dl_jobs,
     };
-    let (rewritten, broken_urls) =
-        rt.block_on(download_and_rewrite(&file_urls, Arc::clone(&refs), &dl_cfg));
+    let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
 
     if !broken_urls.is_empty() {
         eprintln!(
@@ -756,17 +759,49 @@ fn cmd_clean(args: Args) -> Result<(), String> {
             let counter = counter.clone();
             let root_path = root_path.to_path_buf();
             let href_set = href_set.clone();
+            let force = force;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
                     let path = root_path.join(&rel);
-                    let result = crate::clean::clean_file(&path, &root_path, &href_set, !force);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    let scan = crate::clean::scan_file(&rel, &content, &href_set);
+                    if let Some(err) = &scan.error {
+                        return (rel.clone(), Err(format!("{}: {err}", path.display())));
+                    }
+                    if !scan.broken_links.is_empty() && force {
+                        match crate::rewriter::clean_html(&content, &href_set, &rel) {
+                            Ok(new_html) => {
+                                let tmp = path.with_extension("tmp");
+                                if let Err(e) = std::fs::write(&tmp, &new_html)
+                                    .map_err(|e| format!("write tmp: {e}"))
+                                    .and_then(|_| {
+                                        std::fs::rename(&tmp, &path)
+                                            .map_err(|e| format!("rename: {e}"))
+                                    })
+                                {
+                                    return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                                }
+                            }
+                            Err(e) => {
+                                return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                            }
+                        }
+                    }
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
+                        if done.is_multiple_of(16) {
+                            eprint!("\rScanning: {done}/{file_total} files");
+                        }
                         let _ = std::io::stderr().flush();
                     }
-                    (rel.clone(), result)
+                    (
+                        rel.clone(),
+                        Ok(crate::clean::CleanResult {
+                            broken_links: scan.broken_links,
+                            error: scan.error,
+                        }),
+                    )
                 })
                 .await
                 .unwrap()
@@ -909,17 +944,50 @@ fn cmd_zap(args: Args) -> Result<(), String> {
             let root_path = root_path.to_path_buf();
             let selector = selector.clone();
             let query = query.to_string();
+            let apply = apply;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
                     let path = root_path.join(&rel);
-                    let result = crate::zap::zap_file(&path, &selector, &query, !apply);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    let (result, modified) = if apply {
+                        match crate::rewriter::zap_html(&content, &selector, &query) {
+                            Ok((html, matches)) => (
+                                crate::zap::ZapResult {
+                                    matches,
+                                    error: None,
+                                },
+                                Some(html),
+                            ),
+                            Err(e) => {
+                                return (rel.clone(), Err(e));
+                            }
+                        }
+                    } else {
+                        let result = crate::zap::scan_html(&content, &selector, &query);
+                        (result, None)
+                    };
+                    if let Some(new_html) = modified
+                        && (!new_html.is_empty() || content.is_empty())
+                    {
+                        let tmp = path.with_extension("tmp");
+                        if let Err(e) = std::fs::write(&tmp, &new_html)
+                            .map_err(|e| format!("write tmp: {e}"))
+                            .and_then(|_| {
+                                std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
+                            })
+                        {
+                            return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                        }
+                    }
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
+                        if done.is_multiple_of(16) {
+                            eprint!("\rScanning: {done}/{file_total} files");
+                        }
                         let _ = std::io::stderr().flush();
                     }
-                    (rel.clone(), result)
+                    (rel.clone(), Ok(result))
                 })
                 .await
                 .unwrap()
@@ -1046,17 +1114,40 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             let sem = sem.clone();
             let counter = counter.clone();
             let root_path = root_path.to_path_buf();
+            let apply = apply;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
                     let path = root_path.join(&rel);
-                    let result = crate::towebp::towebp_file(&path, !apply);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    let matches = crate::towebp::scan_towebp(&content);
+                    if !matches.is_empty() && apply {
+                        match crate::rewriter::towebp_html(&content) {
+                            Ok(new_html) => {
+                                let tmp = path.with_extension("tmp");
+                                if let Err(e) = std::fs::write(&tmp, &new_html)
+                                    .map_err(|e| format!("write tmp: {e}"))
+                                    .and_then(|_| {
+                                        std::fs::rename(&tmp, &path)
+                                            .map_err(|e| format!("rename: {e}"))
+                                    })
+                                {
+                                    return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                                }
+                            }
+                            Err(e) => {
+                                return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                            }
+                        }
+                    }
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
-                        if done.is_multiple_of(16) { eprint!("\rScanning: {done}/{file_total} files"); }
+                        if done.is_multiple_of(16) {
+                            eprint!("\rScanning: {done}/{file_total} files");
+                        }
                         let _ = std::io::stderr().flush();
                     }
-                    (rel.clone(), result)
+                    (rel.clone(), Ok(matches))
                 })
                 .await
                 .unwrap()

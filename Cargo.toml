@@ -21,6 +21,7 @@ walkdir = "2"
 regex-lite = "0.1"
 rustc-hash = "2"
 jwalk = "0.8.1"
+lol_html = "2"
 
 [features]
 count-alloc = []
@@ -44,6 +45,7 @@ codegen-units = 1
 strip = true
 
 [lints.clippy]
+cargo_common_metadata = { level = "allow", priority = 1 }
 nursery = { level = "allow", priority = -2 }
 pedantic = { level = "allow", priority = -2 }
 complexity = { level = "deny", priority = -2 }

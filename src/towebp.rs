@@ -1,7 +1,6 @@
 use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
 use std::ops::Range;
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct WebpMatch {
@@ -9,7 +8,7 @@ pub struct WebpMatch {
     pub attr: String,
     pub url: String,
     pub new_url: String,
-    ext_span: Range<usize>,
+    pub(crate) ext_span: Range<usize>,
 }
 
 fn image_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
@@ -156,33 +155,6 @@ pub fn scan_towebp(html: &str) -> Vec<WebpMatch> {
     matches
 }
 
-/// Rewrite a single file, replacing jpg/jpeg/png extensions with webp.
-/// Returns the matches that were applied.
-pub fn towebp_file(path: &Path, dry_run: bool) -> Result<Vec<WebpMatch>, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-
-    let matches = scan_towebp(&content);
-
-    if matches.is_empty() || dry_run {
-        return Ok(matches);
-    }
-
-    let mut modified = content;
-    // Sort descending so earlier replacements don't shift later spans.
-    let mut sorted: Vec<&WebpMatch> = matches.iter().collect();
-    sorted.sort_by_key(|m| std::cmp::Reverse(m.ext_span.start));
-    for m in &sorted {
-        modified.replace_range(m.ext_span.clone(), ".webp");
-    }
-
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &modified).map_err(|e| format!("write tmp: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
-
-    Ok(matches)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,66 +265,5 @@ mod tests {
         let html = r#"<video poster="thumb.jpg" src="video.mp4">"#;
         let matches = scan_towebp(html);
         assert_eq!(matches.len(), 0); // poster not in src/href/srcset
-    }
-
-    #[test]
-    fn test_apply_replacement() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(
-            &path,
-            r#"<img src="photo.jpg" alt="x"><img src="logo.png">"#,
-        )
-        .unwrap();
-
-        let matches = towebp_file(&path, false).unwrap();
-        assert_eq!(matches.len(), 2);
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            after,
-            r#"<img src="photo.webp" alt="x"><img src="logo.webp">"#
-        );
-    }
-
-    #[test]
-    fn test_dry_run_does_not_modify() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        let original = r#"<img src="photo.jpg">"#;
-        std::fs::write(&path, original).unwrap();
-
-        let matches = towebp_file(&path, true).unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].url, "photo.jpg");
-        assert_eq!(matches[0].new_url, "photo.webp");
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, original);
-    }
-
-    #[test]
-    fn test_apply_srcset() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(&path, r#"<img srcset="small.jpg 400w, large.png 800w">"#).unwrap();
-
-        let matches = towebp_file(&path, false).unwrap();
-        assert_eq!(matches.len(), 2);
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, r#"<img srcset="small.webp 400w, large.webp 800w">"#);
-    }
-
-    #[test]
-    fn test_apply_preserves_query() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let path = tmpdir.path().join("test.html");
-        std::fs::write(&path, r#"<img src="photo.jpg?w=800&h=600">"#).unwrap();
-
-        towebp_file(&path, false).unwrap();
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, r#"<img src="photo.webp?w=800&h=600">"#);
     }
 }

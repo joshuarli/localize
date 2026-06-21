@@ -91,7 +91,6 @@ pub struct DownloadConfig<'a> {
 /// Returns (rewritten_files, broken_urls).
 pub async fn download_and_rewrite(
     file_urls: &FxHashMap<String, FxHashSet<String>>,
-    all_refs: Arc<[crate::scanner::MediaReference]>,
     cfg: &DownloadConfig<'_>,
 ) -> (FxHashSet<String>, FxHashSet<String>) {
     // Build the set of all unique URLs.
@@ -214,7 +213,6 @@ pub async fn download_and_rewrite(
         let rewritten = rewritten.clone();
         let broken_urls = broken_urls.clone();
         let sem = rewrite_sem.clone();
-        let all_refs = Arc::clone(&all_refs);
         let root = cfg.root.to_path_buf();
         let file_rel = file_rel.clone();
         let assets_dir = cfg.assets_dir.to_string();
@@ -259,10 +257,6 @@ pub async fn download_and_rewrite(
                     if all_ok || has_broken {
                         let _permit = sem.acquire().await.unwrap();
                         let abs = root.join(&file_rel);
-                        let file_refs: Vec<&crate::scanner::MediaReference> = all_refs
-                            .iter()
-                            .filter(|r| &*r.file_path == file_rel.as_str())
-                            .collect();
                         let url_map: FxHashMap<String, String> = urls
                             .iter()
                             .map(|u| (u.clone(), asset_path(u, &assets_dir)))
@@ -278,17 +272,26 @@ pub async fn download_and_rewrite(
                             broken_urls.lock().unwrap().extend(file_broken.clone());
                         }
                         if verbose {
-                            eprintln!(
-                                "\n  rewriting {file_rel} ({} reference(s))",
-                                file_refs.len()
-                            );
+                            eprintln!("\n  rewriting {file_rel}...");
                         }
-                        if let Err(e) =
-                            crate::rewriter::rewrite_file(&abs, &file_refs, &url_map, &file_broken)
-                        {
-                            eprintln!("\n  rewrite {file_rel}: {e}");
-                        } else {
-                            rewritten.lock().unwrap().insert(file_rel.clone());
+                        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+                        match crate::rewriter::apply_html(
+                            &content,
+                            &url_map,
+                            &file_broken,
+                            &file_rel,
+                        ) {
+                            Ok(new_html) => {
+                                let tmp = abs.with_extension("tmp");
+                                if let Err(e) = std::fs::write(&tmp, &new_html) {
+                                    eprintln!("\n  write tmp {file_rel}: {e}");
+                                } else if let Err(e) = std::fs::rename(&tmp, &abs) {
+                                    eprintln!("\n  rename {file_rel}: {e}");
+                                } else {
+                                    rewritten.lock().unwrap().insert(file_rel.clone());
+                                }
+                            }
+                            Err(e) => eprintln!("\n  rewrite {file_rel}: {e}"),
                         }
                     }
                     return;
