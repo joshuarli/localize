@@ -1329,17 +1329,33 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                     tokio::task::spawn_blocking(move || {
                         let abs_path = root_path.join(&resolved);
 
-                        // Skip remote URLs, data URIs, and non-existent files.
+                        // Skip remote URLs and data URIs.
                         if resolved.starts_with("http://")
                             || resolved.starts_with("https://")
                             || resolved.starts_with("data:")
-                            || !abs_path.exists()
                         {
-                            if verbose
-                                && !abs_path.exists()
-                                && !resolved.starts_with("http")
-                                && !resolved.starts_with("data:")
-                            {
+                            return None;
+                        }
+                        // If the original doesn't exist but the .webp already does
+                        // (e.g. from a previous run where HTML rewriting was
+                        // interrupted), treat it as already converted.
+                        if !abs_path.exists() {
+                            let webp_path = abs_path.with_extension("webp");
+                            if webp_path.exists() {
+                                if verbose {
+                                    let _ = writeln!(
+                                        std::io::stderr(),
+                                        "  {resolved} → webp already exists"
+                                    );
+                                }
+                                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                if !verbose && done.is_multiple_of(16) {
+                                    eprint!("\rConverting: {done}/{convert_total} images");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                return Some((resolved, true));
+                            }
+                            if verbose {
                                 let _ = writeln!(
                                     std::io::stderr(),
                                     "  skipping {resolved}: file not found"
@@ -1495,21 +1511,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                     let path = root_path.join(&rel);
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     let all_matches = crate::towebp::scan_towebp(&content);
-                    // Filter matches to those whose resolved path was converted.
-                    let matches: Vec<crate::towebp::WebpMatch> = if apply_flag {
-                        all_matches
-                            .into_iter()
-                            .filter(|m| {
-                                let (url, _desc) = split_url_descriptor(&m.url);
-                                let resolved =
-                                    crate::rewriter::resolve_html_url(&rel, url);
-                                converted.contains(&resolved)
-                            })
-                            .collect()
-                    } else {
-                        all_matches
-                    };
-                    if !matches.is_empty() && apply_flag {
+                    if apply_flag {
                         match crate::rewriter::towebp_html(
                             &content,
                             &rel,
@@ -1532,6 +1534,17 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                             }
                         }
                     }
+                    // Filter matches for display — only show those whose resolved
+                    // path was actually converted.
+                    let matches: Vec<crate::towebp::WebpMatch> = all_matches
+                        .into_iter()
+                        .filter(|m| {
+                            let (url, _desc) = split_url_descriptor(&m.url);
+                            let resolved =
+                                crate::rewriter::resolve_html_url(&rel, url);
+                            converted.contains(&resolved)
+                        })
+                        .collect();
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
                         if done.is_multiple_of(16) {

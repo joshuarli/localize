@@ -730,6 +730,25 @@ mod tests {
     }
 
     #[test]
+    fn test_towebp_html_nested_parent_refs() {
+        // Regression: nested HTML files with `../` paths must resolve to the
+        // same key the CLI phase 1 used when populating `converted`.  This is
+        // the pattern from the real-world bug — product pages in subdirectories
+        // referencing images via `../../_grab/.../file.jpg`.
+        let mut converted = FxHashSet::default();
+        converted.insert("_grab/example.com/uploads/2021/photo.jpg".into());
+
+        // Three levels deep, referencing up two levels then into _grab.
+        let html = r#"<img src="../../_grab/example.com/uploads/2021/photo.jpg">"#;
+        let result =
+            towebp_html(html, "product-category/blades-diy/index.html", &converted).unwrap();
+        assert_eq!(
+            result,
+            r#"<img src="../../_grab/example.com/uploads/2021/photo.webp">"#
+        );
+    }
+
+    #[test]
     fn test_apply_html_single_src() {
         let mut url_map = FxHashMap::default();
         url_map.insert(
