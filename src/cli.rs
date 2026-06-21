@@ -1242,14 +1242,13 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             });
             drop(unique_mu);
             if !verbose && !files.is_empty() {
-                eprintln!();
+                eprint!("\rPhase 1 — scanning: {file_total}/{file_total} files\n");
+                let _ = std::io::stderr().flush();
             }
         }
 
         let unique_images: Vec<String> = unique.into_iter().collect();
-        if verbose {
-            eprintln!("Found {} unique image(s) to convert", unique_images.len());
-        }
+        eprintln!("Found {} unique image(s) to convert", unique_images.len());
 
         // Convert images in parallel, bounded by the semaphore to avoid OOM.
         // Each worker holds at most one decoded image in memory at a time.
@@ -1259,7 +1258,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
         let counter = Arc::new(AtomicUsize::new(0));
         let convert_total = unique_images.len();
 
-        let (converted_count, failed_count) = rt.block_on(async {
+        let (converted_count, failed_count, skipped_count) = rt.block_on(async {
             let sem = Arc::new(Semaphore::new(jobs));
             let mut handles = Vec::with_capacity(unique_images.len());
 
@@ -1279,7 +1278,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                             || resolved.starts_with("https://")
                             || resolved.starts_with("data:")
                         {
-                            return None;
+                            return (resolved, Ok(None));
                         }
                         // If the original doesn't exist but the .webp already does
                         // (e.g. from a previous run where HTML rewriting was
@@ -1287,104 +1286,75 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                         if !abs_path.exists() {
                             let webp_path = abs_path.with_extension("webp");
                             if webp_path.exists() {
-                                if verbose {
-                                    let _ = writeln!(
-                                        std::io::stderr(),
-                                        "  {resolved} → webp already exists"
-                                    );
-                                }
                                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                                 if !verbose && done.is_multiple_of(16) {
                                     eprint!("\rConverting: {done}/{convert_total} images");
                                     let _ = std::io::stderr().flush();
                                 }
-                                return Some((resolved, true));
-                            }
-                            if verbose {
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "  skipping {resolved}: file not found"
-                                );
+                                return (resolved, Ok(Some(true)));
                             }
                             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             if !verbose && done.is_multiple_of(16) {
                                 eprint!("\rConverting: {done}/{convert_total} images");
                                 let _ = std::io::stderr().flush();
                             }
-                            return None;
+                            return (resolved, Ok(None));
                         }
 
                         if verbose {
                             let _ = write!(std::io::stderr(), "  converting {resolved} ... ");
                         }
-                        match crate::webp_encode::convert_to_webp(&abs_path) {
+                        let outcome = match crate::webp_encode::convert_to_webp(&abs_path) {
                             Ok(webp_bytes) => {
                                 let webp_path = abs_path.with_extension("webp");
                                 if let Err(e) = std::fs::write(&webp_path, &webp_bytes) {
-                                    if verbose {
-                                        let _ =
-                                            writeln!(std::io::stderr(), "FAILED (write webp: {e})");
-                                    }
-                                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if !verbose && done.is_multiple_of(16) {
-                                        eprint!("\rConverting: {done}/{convert_total} images");
-                                        let _ = std::io::stderr().flush();
-                                    }
-                                    return Some((resolved, false));
-                                }
-                                // Move original to .trash/.
-                                let trash_path = trash_root.join(&resolved);
-                                if let Some(parent) = trash_path.parent() {
-                                    if let Err(e) = std::fs::create_dir_all(parent) {
-                                        if verbose {
-                                            let _ = writeln!(
-                                                std::io::stderr(),
-                                                "FAILED (create trash dir: {e})"
-                                            );
+                                    Err(format!("write webp: {e}"))
+                                } else {
+                                    let trash_path = trash_root.join(&resolved);
+                                    if let Some(parent) = trash_path.parent() {
+                                        if let Err(e) = std::fs::create_dir_all(parent) {
+                                            let _ = std::fs::remove_file(&webp_path);
+                                            Err(format!("create trash dir: {e}"))
+                                        } else {
+                                            let trash_path = unique_trash_path(&trash_path);
+                                            if let Err(e) = std::fs::rename(&abs_path, &trash_path)
+                                            {
+                                                let _ = std::fs::remove_file(&webp_path);
+                                                Err(format!("move to trash: {e}"))
+                                            } else {
+                                                Ok(())
+                                            }
                                         }
-                                        let _ = std::fs::remove_file(&webp_path);
-                                        let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                        if !verbose && done.is_multiple_of(16) {
-                                            eprint!("\rConverting: {done}/{convert_total} images");
-                                            let _ = std::io::stderr().flush();
+                                    } else {
+                                        let trash_path = unique_trash_path(&trash_path);
+                                        if let Err(e) = std::fs::rename(&abs_path, &trash_path) {
+                                            let _ = std::fs::remove_file(&webp_path);
+                                            Err(format!("move to trash: {e}"))
+                                        } else {
+                                            Ok(())
                                         }
-                                        return Some((resolved, false));
                                     }
                                 }
-                                let trash_path = unique_trash_path(&trash_path);
-                                if let Err(e) = std::fs::rename(&abs_path, &trash_path) {
-                                    if verbose {
-                                        let _ =
-                                            writeln!(std::io::stderr(), "FAILED (move to trash: {e})");
-                                    }
-                                    let _ = std::fs::remove_file(&webp_path);
-                                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if !verbose && done.is_multiple_of(16) {
-                                        eprint!("\rConverting: {done}/{convert_total} images");
-                                        let _ = std::io::stderr().flush();
-                                    }
-                                    return Some((resolved, false));
-                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !verbose && done.is_multiple_of(16) {
+                            eprint!("\rConverting: {done}/{convert_total} images");
+                            let _ = std::io::stderr().flush();
+                        }
+                        match outcome {
+                            Ok(()) => {
                                 if verbose {
                                     let _ = writeln!(std::io::stderr(), "OK");
                                 }
-                                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                if !verbose && done.is_multiple_of(16) {
-                                    eprint!("\rConverting: {done}/{convert_total} images");
-                                    let _ = std::io::stderr().flush();
-                                }
-                                Some((resolved, true))
+                                (resolved, Ok(Some(true)))
                             }
                             Err(e) => {
                                 if verbose {
                                     let _ = writeln!(std::io::stderr(), "FAILED ({e})");
                                 }
-                                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                if !verbose && done.is_multiple_of(16) {
-                                    eprint!("\rConverting: {done}/{convert_total} images");
-                                    let _ = std::io::stderr().flush();
-                                }
-                                Some((resolved, false))
+                                (resolved, Err(e))
                             }
                         }
                     })
@@ -1396,19 +1366,33 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
 
             let mut converted_count = 0usize;
             let mut failed_count = 0usize;
+            let mut skipped_count = 0usize;
+            let mut failure_details: Vec<(String, String)> = Vec::new();
             for handle in handles {
-                if let Ok(Some((resolved, ok))) = handle.await {
-                    if ok {
+                match handle.await {
+                    Ok((resolved, Ok(Some(true)))) => {
                         if let Ok(mut guard) = converted_mu.lock() {
                             guard.insert(resolved);
                         }
                         converted_count += 1;
-                    } else {
+                    }
+                    Ok((_resolved, Ok(None))) => {
+                        skipped_count += 1;
+                    }
+                    Ok((resolved, Err(e))) => {
+                        failure_details.push((resolved, e));
                         failed_count += 1;
                     }
+                    _ => {}
                 }
             }
-            (converted_count, failed_count)
+            if !failure_details.is_empty() {
+                eprintln!();
+                for (path, err) in &failure_details {
+                    eprintln!("  FAILED {path}: {err}");
+                }
+            }
+            (converted_count, failed_count, skipped_count)
         });
         drop(converted_mu);
 
@@ -1416,16 +1400,9 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             eprintln!();
         }
 
-        if converted_count > 0 || failed_count > 0 {
-            eprintln!(
-                "Converted {converted_count} image(s) to webp{}.",
-                if failed_count > 0 {
-                    format!(" ({failed_count} failed)")
-                } else {
-                    String::new()
-                }
-            );
-        }
+        eprintln!(
+            "Converted {converted_count}, failed {failed_count}, skipped {skipped_count}.",
+        );
         if converted.is_empty() {
             eprintln!("No images converted; HTML will not be modified.");
         }
