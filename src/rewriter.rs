@@ -98,25 +98,6 @@ fn rewrite_srcset_value(val: &str, url_map: &FxHashMap<String, String>, file_pat
         .join(", ")
 }
 
-/// Rewrite towebp srcset: replace jpg/jpeg/png extensions with webp.
-fn towebp_srcset_value(val: &str) -> String {
-    val.split(',')
-        .map(|p| {
-            let fields: Vec<&str> = p.split_whitespace().collect();
-            if fields.is_empty() {
-                return p.trim().to_string();
-            }
-            let new_url = towebp_url(fields[0]);
-            if fields.len() > 1 {
-                format!("{} {}", new_url, fields[1..].join(" "))
-            } else {
-                new_url
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Replace the image extension in a URL with `.webp`.
 fn towebp_url(url: &str) -> String {
     let path_end = url
@@ -436,21 +417,69 @@ pub fn clean_html(
 // towebp: image extension rewriting
 // ---------------------------------------------------------------------------
 
+/// Resolve a URL from an HTML file to a normalized relative path.
+/// Query strings and fragments are stripped before resolution so that
+/// `photo.jpg?w=800` resolves to `photo.jpg`.
+pub(crate) fn resolve_html_url(html_rel: &str, url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return url.to_string();
+    }
+    // Strip query string and fragment before resolving the filesystem path.
+    let path_only = url
+        .find('?')
+        .unwrap_or_else(|| url.find('#').unwrap_or(url.len()));
+    let path = &url[..path_only];
+    let html_dir = Path::new(html_rel).parent().unwrap_or(Path::new(""));
+    let combined = html_dir.join(path);
+    let mut parts: Vec<&str> = Vec::new();
+    for c in combined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(p) => {
+                if let Some(s) = p.to_str() {
+                    parts.push(s);
+                }
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return ".".to_string();
+    }
+    parts.join("/")
+}
+
 /// Rewrite HTML for the `towebp` command: replace .jpg/.jpeg/.png extensions
-/// with .webp in src, href, and srcset attributes.
-pub fn towebp_html(html: &str) -> Result<String, String> {
+/// with .webp in src, href, and srcset attributes — but only for images that
+/// were successfully converted (present in `converted`).
+pub fn towebp_html(
+    html: &str,
+    file_rel: &str,
+    converted: &FxHashSet<String>,
+) -> Result<String, String> {
+    let file_rel: Rc<str> = Rc::from(file_rel);
+    let converted: Rc<FxHashSet<String>> = Rc::new(converted.clone());
+
     let mut handlers = Vec::new();
 
     // Single-valued attributes.
     let build_single = |sel: &'static str, attrs: &'static [&'static str]| {
         let attr_list: Vec<&'static str> = attrs.to_vec();
+        let fr = file_rel.clone();
+        let cv = converted.clone();
         element!(sel, move |el| {
             for attr in &attr_list {
                 if let Some(val) = el.get_attribute(attr)
                     && has_image_ext(&val)
                 {
-                    let new_url = towebp_url(&val);
-                    el.set_attribute(attr, &new_url).ok();
+                    let resolved = resolve_html_url(&fr, &val);
+                    if cv.contains(&resolved) {
+                        let new_url = towebp_url(&val);
+                        el.set_attribute(attr, &new_url).ok();
+                    }
                 }
             }
             Ok(())
@@ -464,11 +493,14 @@ pub fn towebp_html(html: &str) -> Result<String, String> {
     handlers.push(build_single("a[href], link[href]", &["href"]));
     handlers.push(build_single("object[data]", &["data"]));
 
-    // srcset attributes — rewrite each URL in the list.
+    // srcset attributes — rewrite each URL in the list (only if the URL's
+    // resolved file was converted).
     {
+        let fr = file_rel.clone();
+        let cv = converted.clone();
         handlers.push(element!("img[srcset], source[srcset]", move |el| {
             if let Some(val) = el.get_attribute("srcset") {
-                let rewritten = towebp_srcset_value(&val);
+                let rewritten = towebp_srcset_value_gated(&val, &fr, &cv);
                 if rewritten != val {
                     el.set_attribute("srcset", &rewritten).ok();
                 }
@@ -483,6 +515,35 @@ pub fn towebp_html(html: &str) -> Result<String, String> {
     };
 
     rewrite_str(html, settings).map_err(|e| format!("lol-html: {e}"))
+}
+
+/// Like towebp_srcset_value, but only rewrites URLs whose resolved file path
+/// is in the `converted` set.
+fn towebp_srcset_value_gated(
+    val: &str,
+    file_rel: &str,
+    converted: &FxHashSet<String>,
+) -> String {
+    val.split(',')
+        .map(|p| {
+            let fields: Vec<&str> = p.split_whitespace().collect();
+            if fields.is_empty() {
+                return p.trim().to_string();
+            }
+            let resolved = resolve_html_url(file_rel, fields[0]);
+            if converted.contains(&resolved) {
+                let new_url = towebp_url(fields[0]);
+                if fields.len() > 1 {
+                    format!("{} {}", new_url, fields[1..].join(" "))
+                } else {
+                    new_url
+                }
+            } else {
+                p.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -581,14 +642,20 @@ mod tests {
     #[test]
     fn test_towebp_srcset() {
         let input = "small.jpg 400w, large.png 800w";
-        let output = towebp_srcset_value(input);
+        let mut converted = FxHashSet::default();
+        converted.insert("small.jpg".into());
+        converted.insert("large.png".into());
+        let output = towebp_srcset_value_gated(input, "index.html", &converted);
         assert_eq!(output, "small.webp 400w, large.webp 800w");
     }
 
     #[test]
     fn test_towebp_html_basic() {
         let html = r#"<img src="photo.jpg" alt="x"><img src="logo.png">"#;
-        let result = towebp_html(html).unwrap();
+        let mut converted = FxHashSet::default();
+        converted.insert("photo.jpg".into());
+        converted.insert("logo.png".into());
+        let result = towebp_html(html, "index.html", &converted).unwrap();
         assert_eq!(
             result,
             r#"<img src="photo.webp" alt="x"><img src="logo.webp">"#
@@ -598,22 +665,68 @@ mod tests {
     #[test]
     fn test_towebp_html_srcset() {
         let html = r#"<img srcset="small.jpg 400w, large.png 800w">"#;
-        let result = towebp_html(html).unwrap();
+        let mut converted = FxHashSet::default();
+        converted.insert("small.jpg".into());
+        converted.insert("large.png".into());
+        let result = towebp_html(html, "index.html", &converted).unwrap();
         assert_eq!(result, r#"<img srcset="small.webp 400w, large.webp 800w">"#);
     }
 
     #[test]
     fn test_towebp_html_query_preserved() {
         let html = r#"<img src="photo.jpg?w=800&amp;h=600">"#;
-        let result = towebp_html(html).unwrap();
+        let mut converted = FxHashSet::default();
+        converted.insert("photo.jpg".into());
+        let result = towebp_html(html, "index.html", &converted).unwrap();
         assert!(result.contains("photo.webp?w=800"), "got: {result}");
     }
 
     #[test]
     fn test_towebp_html_ignores_non_image() {
         let html = r#"<img src="photo.webp"><img src="video.mp4"><a href="page.html">"#;
-        let result = towebp_html(html).unwrap();
+        let converted = FxHashSet::default();
+        let result = towebp_html(html, "index.html", &converted).unwrap();
         assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_towebp_html_gated() {
+        // Only photo.jpg was converted; logo.png should NOT be rewritten.
+        let html = r#"<img src="photo.jpg" alt="x"><img src="logo.png">"#;
+        let mut converted = FxHashSet::default();
+        converted.insert("photo.jpg".into());
+        let result = towebp_html(html, "index.html", &converted).unwrap();
+        assert_eq!(
+            result,
+            r#"<img src="photo.webp" alt="x"><img src="logo.png">"#
+        );
+    }
+
+    #[test]
+    fn test_resolve_html_url_same_file_different_html_paths() {
+        // Regression: the unique-image dedup relies on resolve_html_url returning
+        // the same key for the same image file regardless of which HTML file
+        // references it.
+        let from_root = resolve_html_url("index.html", "images/photo.jpg");
+        let from_subdir = resolve_html_url("blog/post.html", "../images/photo.jpg");
+        assert_eq!(from_root, "images/photo.jpg");
+        assert_eq!(from_subdir, "images/photo.jpg");
+    }
+
+    #[test]
+    fn test_towebp_html_dedup_across_files() {
+        // Same image referenced from two HTML files at different paths.  When
+        // the image is in the converted set, both files' references get rewritten.
+        let mut converted = FxHashSet::default();
+        converted.insert("images/photo.jpg".into());
+
+        let html_root = r#"<img src="images/photo.jpg">"#;
+        let result = towebp_html(html_root, "index.html", &converted).unwrap();
+        assert_eq!(result, r#"<img src="images/photo.webp">"#);
+
+        let html_sub = r#"<img src="../images/photo.jpg">"#;
+        let result = towebp_html(html_sub, "blog/post.html", &converted).unwrap();
+        assert_eq!(result, r#"<img src="../images/photo.webp">"#);
     }
 
     #[test]

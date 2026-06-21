@@ -22,6 +22,9 @@ regex-lite = "0.1"
 rustc-hash = "2"
 jwalk = "0.8.1"
 lol_html = "2"
+zenwebp = "0.4.4"
+png = "0.18.1"
+zune-jpeg = "0.5.15"
 
 [features]
 count-alloc = []

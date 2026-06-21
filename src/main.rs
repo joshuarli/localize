@@ -5,6 +5,7 @@ mod downloader;
 mod rewriter;
 mod scanner;
 mod towebp;
+mod webp_encode;
 mod zap;
 
 #[cfg(feature = "count-alloc")]
