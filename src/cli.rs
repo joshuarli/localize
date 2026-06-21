@@ -1480,16 +1480,20 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                         }
                     }
                     // Filter matches for display — only show those whose resolved
-                    // path was actually converted.
-                    let matches: Vec<crate::towebp::WebpMatch> = all_matches
-                        .into_iter()
-                        .filter(|m| {
-                            let (url, _desc) = split_url_descriptor(&m.url);
-                            let resolved =
-                                crate::rewriter::resolve_html_url(&rel, url);
-                            converted.contains(&resolved)
-                        })
-                        .collect();
+                    // path was actually converted (apply mode only).
+                    let matches: Vec<crate::towebp::WebpMatch> = if apply_flag {
+                        all_matches
+                            .into_iter()
+                            .filter(|m| {
+                                let (url, _desc) = split_url_descriptor(&m.url);
+                                let resolved =
+                                    crate::rewriter::resolve_html_url(&rel, url);
+                                converted.contains(&resolved)
+                            })
+                            .collect()
+                    } else {
+                        all_matches
+                    };
                     let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose {
                         if done.is_multiple_of(16) {

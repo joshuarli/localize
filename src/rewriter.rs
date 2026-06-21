@@ -749,6 +749,17 @@ mod tests {
     }
 
     #[test]
+    fn test_towebp_html_no_conversions_leaves_html_untouched() {
+        // Regression: with an empty converted set (dry-run, or nothing converted),
+        // towebp_html must leave all references intact so the scan output is
+        // accurate.
+        let converted = FxHashSet::default();
+        let html = r#"<img src="photo.jpg"><img src="logo.png"><img srcset="a.jpg 1x, b.png 2x">"#;
+        let result = towebp_html(html, "index.html", &converted).unwrap();
+        assert_eq!(result, html);
+    }
+
+    #[test]
     fn test_apply_html_single_src() {
         let mut url_map = FxHashMap::default();
         url_map.insert(
