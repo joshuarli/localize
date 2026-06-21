@@ -8,7 +8,6 @@ pub struct WebpMatch {
     pub attr: String,
     pub url: String,
     pub new_url: String,
-    pub(crate) ext_span: Range<usize>,
 }
 
 fn image_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
@@ -119,7 +118,7 @@ pub fn scan_towebp(html: &str) -> Vec<WebpMatch> {
 
                 if attr_name == "srcset" {
                     for (url, descriptor) in parse_srcset_entries(attr_value) {
-                        if let Some(ext_span) = find_ext_span(raw, attr.span.start, &url) {
+                        if find_ext_span(raw, attr.span.start, &url).is_some() {
                             let new_url = to_webp_url(&url);
                             let new_entry = if let Some(ref d) = descriptor {
                                 format!("{new_url} {d}")
@@ -134,18 +133,16 @@ pub fn scan_towebp(html: &str) -> Vec<WebpMatch> {
                                     descriptor = descriptor.as_deref().unwrap_or("")
                                 ),
                                 new_url: new_entry,
-                                ext_span,
                             });
                         }
                     }
-                } else if let Some(ext_span) = find_ext_span(raw, attr.span.start, attr_value) {
+                } else if find_ext_span(raw, attr.span.start, attr_value).is_some() {
                     let new_url = to_webp_url(attr_value);
                     matches.push(WebpMatch {
                         tag: tag_name.to_string(),
                         attr: attr_name.to_string(),
                         url: attr_value.to_string(),
                         new_url,
-                        ext_span,
                     });
                 }
             }

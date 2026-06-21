@@ -147,6 +147,7 @@ pub struct MediaReference {
     pub attr: MediaAttr,
     pub url: Box<str>,
     /// Byte range of the URL in the source file.
+    #[allow(dead_code)]
     pub span: Range<usize>,
     pub descriptor: Option<SrcsetDescriptor>,
     /// true if this is a local URL whose file does not exist on disk.

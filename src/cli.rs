@@ -759,7 +759,6 @@ fn cmd_clean(args: Args) -> Result<(), String> {
             let counter = counter.clone();
             let root_path = root_path.to_path_buf();
             let href_set = href_set.clone();
-            let force = force;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
@@ -944,7 +943,6 @@ fn cmd_zap(args: Args) -> Result<(), String> {
             let root_path = root_path.to_path_buf();
             let selector = selector.clone();
             let query = query.to_string();
-            let apply = apply;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
@@ -1114,7 +1112,6 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             let sem = sem.clone();
             let counter = counter.clone();
             let root_path = root_path.to_path_buf();
-            let apply = apply;
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 tokio::task::spawn_blocking(move || {
