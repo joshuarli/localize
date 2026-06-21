@@ -215,7 +215,8 @@ mod tests {
         std::fs::write(&file_path, html).unwrap();
 
         let refs = crate::scanner::scan_file("test.html", html).references;
-        assert_eq!(refs.len(), 1);
+        // Remote <a href> + local <img src> now both captured.
+        assert_eq!(refs.len(), 2);
         let refs: Vec<&MediaReference> = refs.iter().collect();
 
         let url_map = FxHashMap::default(); // no downloads succeeded

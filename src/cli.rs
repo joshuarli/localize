@@ -1,6 +1,6 @@
+use crate::clean::resolve_href;
 use crate::downloader::{DownloadConfig, asset_path, download_and_rewrite};
-use crate::rewriter::compute_relative_path;
-use crate::scanner::{MediaReference, scan_file};
+use crate::scanner::{MediaReference, is_remote_url, scan_file};
 use lexopt::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Write;
@@ -321,26 +321,20 @@ async fn scan_all(root: &str, files: &[String], jobs: usize, verbose: bool) -> V
     all_refs
 }
 
-fn print_human(refs: &[MediaReference], assets_dir: &str) {
-    let mut current_file: Option<&str> = None;
+fn print_human(refs: &[MediaReference]) {
     for r in refs {
-        if current_file != Some(&r.file_path) {
-            if current_file.is_some() {
-                println!();
-            }
-            current_file = Some(&r.file_path);
+        if !is_remote_url(&r.url) && !r.broken {
+            continue;
         }
-
-        let local = asset_path(&r.url, assets_dir);
-        println!("{}", r.file_path);
-        println!("  type: {}", r.tag);
-        if r.attr != r.tag {
-            println!("  attr: {}", r.attr);
-        }
-        println!("  url: {}", r.url);
-        println!("  local: {local}");
-        if let Some(desc) = &r.descriptor {
-            println!("  descriptor: {desc}");
+        let kind = if r.broken {
+            "broken-local-url"
+        } else {
+            "remote-url"
+        };
+        if let Some(ref desc) = r.descriptor {
+            println!("{kind}: ./{}:{}:{}  {}  {desc}", r.file_path, r.line, r.col, r.url);
+        } else {
+            println!("{kind}: ./{}:{}:{}  {}", r.file_path, r.line, r.col, r.url);
         }
     }
 }
@@ -363,19 +357,26 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn print_json(refs: &[MediaReference], assets_dir: &str) {
+fn print_json(refs: &[MediaReference]) {
     print!("[");
     for (i, r) in refs.iter().enumerate() {
         if i > 0 {
             print!(",");
         }
-        let local_rel = asset_path(&r.url, assets_dir);
-        let replacement = compute_relative_path(&r.file_path, &local_rel);
+        let kind = if r.broken {
+            "broken-local-url"
+        } else if is_remote_url(&r.url) {
+            "remote-url"
+        } else {
+            "local-url"
+        };
         print!(
-            "\n  {{\"file\":{},\"url\":{},\"replacement\":{},\"tag\":{},\"attr\":{}",
+            "\n  {{\"file\":{},\"url\":{},\"kind\":{},\"line\":{},\"col\":{},\"tag\":{},\"attr\":{}",
             json_escape(&r.file_path),
             json_escape(&r.url),
-            json_escape(&replacement),
+            json_escape(kind),
+            r.line,
+            r.col,
             json_escape(&r.tag),
             json_escape(&r.attr),
         );
@@ -390,6 +391,42 @@ fn print_json(refs: &[MediaReference], assets_dir: &str) {
         println!();
     }
     println!("]");
+}
+
+/// Compute the canonical href for an HTML file, matching clean::scan_file's logic.
+fn doc_canonical_href(file_path: &str) -> (String, bool) {
+    let normalized = file_path.replace('\\', "/");
+    if normalized.ends_with("/index.html") || normalized.ends_with("/index.htm") {
+        match normalized.rfind('/') {
+            Some(pos) => (normalized[..pos].to_string(), true),
+            None => (String::new(), true),
+        }
+    } else if normalized == "index.html" || normalized == "index.htm" {
+        (String::new(), true)
+    } else {
+        (normalized, false)
+    }
+}
+
+/// For each local MediaReference, resolve the href and check whether the file
+/// exists in the pre-built href set. Sets `broken = true` when the file is missing.
+fn check_local_urls(refs: &mut [MediaReference], href_set: &FxHashSet<String>) {
+    let mut scratch = String::new();
+    let mut decode_buf = String::new();
+    for r in refs.iter_mut() {
+        if is_remote_url(&r.url) {
+            continue;
+        }
+        let (doc_href, doc_is_index) = doc_canonical_href(&r.file_path);
+        let resolved = resolve_href(
+            &doc_href,
+            doc_is_index,
+            &r.url,
+            &mut scratch,
+            &mut decode_buf,
+        );
+        r.broken = !href_set.contains(resolved);
+    }
 }
 
 fn cmd_scan(args: Args) -> Result<(), String> {
@@ -419,20 +456,31 @@ fn cmd_scan(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
-    eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
-    let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose));
-
-    if args.json {
-        print_json(&refs, &args.assets_dir);
-    } else {
-        print_human(&refs, &args.assets_dir);
+    eprintln!("Building file index...");
+    let href_set = crate::clean::build_href_set(Path::new(root));
+    if args.verbose {
+        eprintln!("Indexed {} file(s)", href_set.len());
     }
 
+    eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
+    let mut refs = rt.block_on(scan_all(root, &files, jobs, args.verbose));
+
+    check_local_urls(&mut refs, &href_set);
+
+    if args.json {
+        print_json(&refs);
+    } else {
+        print_human(&refs);
+    }
+
+    let broken_count = refs.iter().filter(|r| r.broken).count();
     if args.verbose {
         eprintln!(
-            "\nTotal: {} external reference(s) in {} file(s)",
+            "\nTotal: {} reference(s) in {} file(s) ({} local broken, {} remote)",
             refs.len(),
-            files.len()
+            files.len(),
+            broken_count,
+            refs.len() - broken_count,
         );
     }
 
@@ -519,7 +567,7 @@ fn cmd_apply(args: Args) -> Result<(), String> {
             println!("  {f} ({} reference(s))", by_file[f].len());
         }
         if args.json {
-            print_json(&refs, &args.assets_dir);
+            print_json(&refs);
         }
         return Ok(());
     }
@@ -597,7 +645,7 @@ fn cmd_apply(args: Args) -> Result<(), String> {
     }
 
     if args.json {
-        print_json(&refs, &args.assets_dir);
+        print_json(&refs);
     }
 
     eprintln!(

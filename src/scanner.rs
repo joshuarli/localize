@@ -7,6 +7,9 @@ use std::sync::LazyLock;
 static CSS_URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"url\(\s*["']?\s*(https?://[^"'\s()]+)\s*["']?\s*\)"#).unwrap());
 
+static CSS_LOCAL_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"url\(\s*["']?\s*([^"'\s()]+)\s*["']?\s*\)"#).unwrap());
+
 #[derive(Debug, Clone)]
 pub struct MediaReference {
     pub file_path: String,
@@ -16,6 +19,12 @@ pub struct MediaReference {
     /// Byte range of the URL in the source file.
     pub span: Range<usize>,
     pub descriptor: Option<String>,
+    /// true if this is a local URL whose file does not exist on disk.
+    pub broken: bool,
+    /// 1-based line number of the URL in the source file.
+    pub line: usize,
+    /// 1-based column number of the URL in the source file.
+    pub col: usize,
 }
 
 #[derive(Debug)]
@@ -87,11 +96,35 @@ fn is_media_url(url: &str) -> bool {
     )
 }
 
-fn is_remote_url(url: &str) -> bool {
+pub(crate) fn is_remote_url(url: &str) -> bool {
     if url.is_empty() {
         return false;
     }
     url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn line_col_of_offset(source: &str, offset: usize) -> (usize, usize) {
+    let prefix = &source[..offset.min(source.len())];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = offset - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0) + 1;
+    (line, col)
+}
+
+fn is_local_media_ref(url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    if url.starts_with('#') || url.starts_with('?') {
+        return false;
+    }
+    if url.starts_with("data:")
+        || url.starts_with("javascript:")
+        || url.starts_with("mailto:")
+        || url.starts_with("//")
+    {
+        return false;
+    }
+    true
 }
 
 /// Check whether a URL is an analytics/tracking beacon masquerading as a media URL.
@@ -133,6 +166,21 @@ fn find_value_in_attr(raw: &str, attr_start: usize, value: &str) -> Option<Range
 pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
     let mut refs: Vec<MediaReference> = Vec::new();
 
+    let mut push_ref = |tag: &str, attr: &str, url: &str, span: Range<usize>, descriptor: Option<String>| {
+        let (line, col) = line_col_of_offset(html, span.start);
+        refs.push(MediaReference {
+            file_path: file_path.to_string(),
+            tag: tag.to_string(),
+            attr: attr.to_string(),
+            url: url.to_string(),
+            span,
+            descriptor,
+            broken: false,
+            line,
+            col,
+        });
+    };
+
     let tokenizer = Tokenizer::new_with_emitter(html, DefaultEmitter::<usize>::new_with_span());
 
     // Track <style> element content.
@@ -159,7 +207,6 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                     in_style = true;
                     // Style content starts after the opening tag's '>'.
                     style_start = tag.span.end;
-                    // Also check for remote URLs in inline style attrs on <style> itself (unlikely but correct).
                     for (name, attr) in &tag.attributes {
                         if &name[..] == b"style" {
                             let val = std::str::from_utf8(&attr[..]).unwrap_or("");
@@ -168,14 +215,19 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                                 if let Some(url_match) = m.get(1) {
                                     let url = url_match.as_str();
                                     if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
-                                        refs.push(MediaReference {
-                                            file_path: file_path.to_string(),
-                                            tag: "style".into(),
-                                            attr: "style".into(),
-                                            url: url.to_string(),
-                                            span: url_span,
-                                            descriptor: None,
-                                        });
+                                        push_ref("style", "style", url, url_span, None);
+                                    }
+                                }
+                            }
+                            for m in CSS_LOCAL_URL_RE.captures_iter(val) {
+                                if let Some(url_match) = m.get(1) {
+                                    let url = url_match.as_str();
+                                    if !is_remote_url(url)
+                                        && is_local_media_ref(url)
+                                        && let Some(url_span) =
+                                            find_value_in_attr(raw, attr.span.start, url)
+                                    {
+                                        push_ref("style", "style", url, url_span, None);
                                     }
                                 }
                             }
@@ -214,40 +266,48 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                     {
                         if attr_name == "srcset" {
                             for (url, descriptor) in parse_srcset_entries(attr_value) {
-                                if is_remote_url(&url) {
-                                    if let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url) {
-                                        refs.push(MediaReference {
-                                            file_path: file_path.to_string(),
-                                            tag: std::str::from_utf8(tag_name)
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            attr: "srcset".into(),
-                                            url: url.to_string(),
-                                            span: url_span,
-                                            descriptor,
-                                        });
-                                    }
+                                if (is_remote_url(&url) || is_local_media_ref(&url))
+                                    && let Some(url_span) = find_value_in_attr(raw, attr.span.start, &url)
+                                {
+                                    push_ref(
+                                        std::str::from_utf8(tag_name).unwrap_or(""),
+                                        "srcset",
+                                        &url,
+                                        url_span,
+                                        descriptor,
+                                    );
                                 }
                             }
                         } else if is_remote_url(attr_value) {
-                            // Skip analytics/tracking beacons (e.g. pixel.wp.com/g.gif).
                             if is_tracking_url(attr_value) {
                                 continue;
                             }
-                            // <a> and <link> are for navigation, not media — only
-                            // match if the URL points to a media file.
                             if (tag_name == b"a" || tag_name == b"link") && !is_media_url(attr_value) {
                                 continue;
                             }
                             if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
-                                refs.push(MediaReference {
-                                    file_path: file_path.to_string(),
-                                    tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
-                                    attr: attr_name.to_string(),
-                                    url: attr_value.to_string(),
-                                    span: url_span,
-                                    descriptor: None,
-                                });
+                                push_ref(
+                                    std::str::from_utf8(tag_name).unwrap_or(""),
+                                    attr_name,
+                                    attr_value,
+                                    url_span,
+                                    None,
+                                );
+                            }
+                        } else if is_local_media_ref(attr_value) {
+                            // <a> and <link> are for navigation — only capture
+                            // local hrefs that point to media files.
+                            if (tag_name == b"a" || tag_name == b"link") && !is_media_url(attr_value) {
+                                continue;
+                            }
+                            if let Some(url_span) = find_value_in_attr(raw, attr.span.start, attr_value) {
+                                push_ref(
+                                    std::str::from_utf8(tag_name).unwrap_or(""),
+                                    attr_name,
+                                    attr_value,
+                                    url_span,
+                                    None,
+                                );
                             }
                         }
                     }
@@ -261,20 +321,12 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                             for (cname, cattr) in &tag.attributes {
                                 if &cname[..] == b"content" {
                                     let content_val = std::str::from_utf8(&cattr[..]).unwrap_or("");
-                                    if is_remote_url(content_val) {
-                                        let craw = &html[cattr.span.start..cattr.span.end];
-                                        if let Some(url_span) =
+                                    let craw = &html[cattr.span.start..cattr.span.end];
+                                    if (is_remote_url(content_val) || is_local_media_ref(content_val))
+                                        && let Some(url_span) =
                                             find_value_in_attr(craw, cattr.span.start, content_val)
-                                        {
-                                            refs.push(MediaReference {
-                                                file_path: file_path.to_string(),
-                                                tag: "meta".into(),
-                                                attr: "content".into(),
-                                                url: content_val.to_string(),
-                                                span: url_span,
-                                                descriptor: None,
-                                            });
-                                        }
+                                    {
+                                        push_ref("meta", "content", content_val, url_span, None);
                                     }
                                 }
                             }
@@ -283,18 +335,36 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
 
                     // 3. Inline style attributes on any tag.
                     if attr_name == "style" {
+                        // Remote URLs.
                         for m in CSS_URL_RE.captures_iter(attr_value) {
                             if let Some(url_match) = m.get(1) {
                                 let url = url_match.as_str();
                                 if let Some(url_span) = find_value_in_attr(raw, attr.span.start, url) {
-                                    refs.push(MediaReference {
-                                        file_path: file_path.to_string(),
-                                        tag: std::str::from_utf8(tag_name).unwrap_or("").to_string(),
-                                        attr: "style".into(),
-                                        url: url.to_string(),
-                                        span: url_span,
-                                        descriptor: None,
-                                    });
+                                    push_ref(
+                                        std::str::from_utf8(tag_name).unwrap_or(""),
+                                        "style",
+                                        url,
+                                        url_span,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        // Local URLs (not already matched by CSS_URL_RE which requires https?://).
+                        for m in CSS_LOCAL_URL_RE.captures_iter(attr_value) {
+                            if let Some(url_match) = m.get(1) {
+                                let url = url_match.as_str();
+                                if !is_remote_url(url)
+                                    && is_local_media_ref(url)
+                                    && let Some(url_span) = find_value_in_attr(raw, attr.span.start, url)
+                                {
+                                    push_ref(
+                                        std::str::from_utf8(tag_name).unwrap_or(""),
+                                        "style",
+                                        url,
+                                        url_span,
+                                        None,
+                                    );
                                 }
                             }
                         }
@@ -314,14 +384,17 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
                         let url = url_match.as_str();
                         let abs_start = style_start + url_match.start();
                         let abs_end = style_start + url_match.end();
-                        refs.push(MediaReference {
-                            file_path: file_path.to_string(),
-                            tag: "style".into(),
-                            attr: "css".into(),
-                            url: url.to_string(),
-                            span: abs_start..abs_end,
-                            descriptor: None,
-                        });
+                        push_ref("style", "css", url, abs_start..abs_end, None);
+                    }
+                }
+                for m in CSS_LOCAL_URL_RE.captures_iter(style_content) {
+                    if let Some(url_match) = m.get(1) {
+                        let url = url_match.as_str();
+                        if !is_remote_url(url) && is_local_media_ref(url) {
+                            let abs_start = style_start + url_match.start();
+                            let abs_end = style_start + url_match.end();
+                            push_ref("style", "css", url, abs_start..abs_end, None);
+                        }
                     }
                 }
             }
@@ -337,7 +410,6 @@ pub fn scan_file(file_path: &str, html: &str) -> ScanResult {
 }
 
 /// Parse srcset entries. Returns Vec of (url, optional_descriptor).
-/// Only returns entries with remote URLs.
 fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
     let mut entries = Vec::new();
     for part in raw.split(',') {
@@ -345,15 +417,11 @@ fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
         if part.is_empty() {
             continue;
         }
-        // Split into tokens: URL followed by optional descriptor.
         let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.is_empty() {
             continue;
         }
         let url = tokens[0];
-        if !is_remote_url(url) {
-            continue;
-        }
         let descriptor = if tokens.len() > 1 {
             Some(tokens[1..].join(" "))
         } else {
@@ -410,10 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ignores_relative_src() {
+    fn test_captures_local_img_src() {
         let html = r#"<img src="images/photo.jpg">"#;
         let result = scan_file("test.html", html);
-        assert_eq!(result.references.len(), 0);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "images/photo.jpg");
+        assert_eq!(result.references[0].tag, "img");
+        assert_eq!(result.references[0].attr, "src");
+        assert!(!result.references[0].broken);
     }
 
     #[test]
@@ -509,16 +581,29 @@ mod tests {
     }
 
     #[test]
-    fn test_ignores_root_relative_src() {
+    fn test_captures_root_relative_src() {
         let html = r#"<img src="/assets/logo.png">"#;
         let result = scan_file("test.html", html);
-        assert_eq!(result.references.len(), 0);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "/assets/logo.png");
     }
 
     #[test]
-    fn test_link_href_ignores_relative() {
+    fn test_link_href_captures_local_media() {
+        // Local .css href in <link> — media extension, so captured.
         let html = r#"<link rel="stylesheet" href="local/style.css">"#;
         let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "local/style.css");
+        assert_eq!(result.references[0].tag, "link");
+    }
+
+    #[test]
+    fn test_link_href_ignores_local_non_media() {
+        // Local href in <link> without media extension — skipped.
+        let html = r#"<link rel="alternate" href="feed.xml">"#;
+        let result = scan_file("test.html", html);
+        // .xml is not a media extension, so it's skipped.
         assert_eq!(result.references.len(), 0);
     }
 
@@ -709,5 +794,125 @@ mod tests {
         );
         let extracted = &html[result.references[0].span.start..result.references[0].span.end];
         assert_eq!(extracted, "https://a.com/img.jpg?w=400&amp;h=300");
+    }
+
+    #[test]
+    fn test_local_a_href_media() {
+        let html = r#"<a href="docs/manual.pdf">PDF</a>"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "docs/manual.pdf");
+        assert_eq!(result.references[0].tag, "a");
+    }
+
+    #[test]
+    fn test_local_a_href_non_media_ignored() {
+        let html = r#"<a href="about.html">About</a>"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_local_video_src() {
+        let html = r#"<video src="media/intro.mp4"></video>"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "media/intro.mp4");
+        assert_eq!(result.references[0].tag, "video");
+    }
+
+    #[test]
+    fn test_local_script_src() {
+        let html = r#"<script src="js/app.js"></script>"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "js/app.js");
+        assert_eq!(result.references[0].tag, "script");
+    }
+
+    #[test]
+    fn test_local_srcset() {
+        let html = r#"<img srcset="img/small.jpg 400w, img/large.jpg 800w">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 2);
+        assert_eq!(result.references[0].url, "img/small.jpg");
+        assert_eq!(result.references[0].descriptor.as_deref(), Some("400w"));
+        assert_eq!(result.references[1].url, "img/large.jpg");
+        assert_eq!(result.references[1].descriptor.as_deref(), Some("800w"));
+    }
+
+    #[test]
+    fn test_local_mixed_srcset() {
+        let html = r#"<img srcset="local/a.jpg 1x, https://cdn.example.com/b.jpg 2x">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 2);
+        assert_eq!(result.references[0].url, "local/a.jpg");
+        assert_eq!(result.references[1].url, "https://cdn.example.com/b.jpg");
+    }
+
+    #[test]
+    fn test_local_inline_style_url() {
+        let html = r#"<div style="background: url(../img/bg.png)"></div>"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "../img/bg.png");
+        assert_eq!(result.references[0].tag, "div");
+        assert_eq!(result.references[0].attr, "style");
+    }
+
+    #[test]
+    fn test_local_style_block_url() {
+        let html = "<style>.hero { background: url(images/hero.jpg); }</style>";
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "images/hero.jpg");
+        assert_eq!(result.references[0].tag, "style");
+        assert_eq!(result.references[0].attr, "css");
+    }
+
+    #[test]
+    fn test_local_meta_og_image() {
+        let html = r#"<meta property="og:image" content="/img/hero.png">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 1);
+        assert_eq!(result.references[0].url, "/img/hero.png");
+        assert_eq!(result.references[0].tag, "meta");
+    }
+
+    #[test]
+    fn test_ignores_fragment_only() {
+        let html = "<img src=\"#section\">";
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_ignores_query_only() {
+        let html = r#"<img src="?v=2">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_ignores_javascript_url() {
+        let html = r#"<img src="javascript:void(0)">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_ignores_mailto() {
+        let html = r#"<a href="mailto:user@example.com">email</a>"#;
+        let result = scan_file("test.html", html);
+        // mailto is not a media URL extension, so skipped for <a>.
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn test_ignores_protocol_relative() {
+        // Protocol-relative URLs (//example.com/foo) are not local.
+        let html = r#"<img src="//cdn.example.com/logo.png">"#;
+        let result = scan_file("test.html", html);
+        assert_eq!(result.references.len(), 0);
     }
 }

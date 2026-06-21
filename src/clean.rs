@@ -151,7 +151,7 @@ fn percent_decode_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
 /// Fragment (`#`) and query (`?`) are stripped from the RAW href BEFORE
 /// percent-decoding, so that `%23` (encoded `#`) in a filename is preserved
 /// as a literal `#` in the resolved path rather than treated as a fragment.
-fn resolve_href<'a>(
+pub(crate) fn resolve_href<'a>(
     doc_href: &str,
     doc_is_index: bool,
     raw_href: &str,
