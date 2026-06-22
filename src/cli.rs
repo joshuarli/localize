@@ -30,6 +30,7 @@ struct Args {
     zap_tag: Option<String>,
     zap_query: Option<String>,
     // translate
+    file: Option<String>,
     from_lang: Option<String>,
     to_lang: String,
     apply: bool,
@@ -60,6 +61,7 @@ impl Default for Args {
             referer: String::new(),
             zap_tag: None,
             zap_query: None,
+            file: None,
             from_lang: None,
             to_lang: "en".into(),
             apply: false,
@@ -140,6 +142,7 @@ Extract-css flags:
   -d, --dir <dir>       Output directory for CSS files [default: localized-css].
 
 Translate flags:
+  -f, --file <path>     Translate a single file instead of walking a directory.
   --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
                         per file if omitted.
   --to <lang>           Target language (BCP-47, default: en).
@@ -272,6 +275,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("to") => {
                 args.to_lang = parser.value()?.string()?;
+            }
+            Short('f') | Long("file") => {
+                args.file = Some(parser.value()?.string()?);
             }
             Long("help") | Short('h') => {
                 print_help();
@@ -2328,29 +2334,35 @@ fn unique_trash_path(path: &Path) -> std::path::PathBuf {
 }
 
 fn cmd_translate(args: Args) -> Result<(), String> {
-    let root = args.root.as_deref().unwrap_or(".");
     let apply = args.apply;
     let verbose = args.verbose;
     let to_lang = &args.to_lang;
     let from_lang = args.from_lang.as_deref();
 
-    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
-    let include: &[String] = if args.include.is_empty() {
-        &default_include
+    let (root_path, files): (std::path::PathBuf, Vec<String>) = if let Some(file) = &args.file {
+        eprintln!("Translating single file: {file}");
+        (std::path::PathBuf::from("."), vec![file.clone()])
     } else {
-        &args.include
+        let root = args.root.as_deref().unwrap_or(".");
+        let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+        let include: &[String] = if args.include.is_empty() {
+            &default_include
+        } else {
+            &args.include
+        };
+
+        eprintln!("Discovering HTML files in {root}...");
+        let files = iter_html_files(root, include, &args.exclude);
+
+        if verbose {
+            eprintln!("Found {} HTML file(s) to process", files.len());
+        }
+        if files.is_empty() {
+            eprintln!("No HTML files found.");
+            return Ok(());
+        }
+        (std::path::PathBuf::from(root), files)
     };
-
-    eprintln!("Discovering HTML files in {root}...");
-    let files = iter_html_files(root, include, &args.exclude);
-
-    if verbose {
-        eprintln!("Found {} HTML file(s) to process", files.len());
-    }
-    if files.is_empty() {
-        eprintln!("No HTML files found.");
-        return Ok(());
-    }
 
     apple_translate_rs_sync::set_worker_num_engines(2);
 
@@ -2366,7 +2378,6 @@ fn cmd_translate(args: Args) -> Result<(), String> {
         );
     }
 
-    let root_path = std::path::Path::new(root);
     let mut total_segments = 0usize;
     let mut total_translated = 0usize;
     let mut file_count = 0usize;
