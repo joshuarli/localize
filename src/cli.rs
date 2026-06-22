@@ -74,6 +74,9 @@ Commands:
                 With --download, fetch remote assets and rewrite HTML to use
                 local paths.  With --clean, fix broken local links by
                 unwrapping dead <a> tags and removing dead resource elements.
+  minify-html   Minify HTML files: strip whitespace, remove comments,
+                collapse redundant attributes, omit optional tags. Dry-run
+                by default, --apply to write.
   zap           Remove HTML elements matching a CSS selector whose inner text
                 contains a query string. Dry-run by default, --apply to remove.
   towebp        Replace .jpg/.jpeg/.png URL extensions with .webp in href,
@@ -108,6 +111,9 @@ Zap flags:
 Towebp flags:
   --apply               Apply rewrites (dry-run by default).
 
+Minify-html flags:
+  --apply               Apply minification (dry-run by default).
+
 Translate flags:
   --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
                         per file if omitted.
@@ -120,6 +126,7 @@ Examples:
   localize check ~/mysite --clean
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply
+  localize minify-html ~/mysite --apply
   localize translate ~/mysite --to en --apply"
     );
 }
@@ -141,7 +148,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (check, zap, towebp, or translate)".into());
+                return Err("expected subcommand (check, minify-html, zap, towebp, or translate)".into());
             }
         }
     }
@@ -811,6 +818,119 @@ fn verify_no_remote(files: &[String], root: &str) -> Vec<String> {
         }
     }
     stray
+}
+
+fn cmd_minify_html(args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+    let apply = args.apply;
+    let verbose = args.verbose;
+
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+    let jobs = if args.jobs == 0 {
+        num_cpus() * 4
+    } else {
+        args.jobs
+    };
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = iter_html_files(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to minify", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    if apply {
+        eprintln!(
+            "Minifying {} file(s) with {jobs} workers...",
+            files.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: scanning {} file(s) with {jobs} workers...",
+            files.len()
+        );
+    }
+
+    let root_path = std::path::Path::new(root);
+    let counter = AtomicUsize::new(0);
+    let total_saved = AtomicUsize::new(0);
+    let file_count = files.len();
+    let workers = jobs.min(files.len());
+
+    let index = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|s| {
+        let files: &[String] = &files;
+        let counter: &AtomicUsize = &counter;
+        let total_saved: &AtomicUsize = &total_saved;
+        for _ in 0..workers {
+            let index = Arc::clone(&index);
+            s.spawn(move || {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= file_count {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
+                    let original = match std::fs::read(&path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("{rel}: read error: {e}");
+                            continue;
+                        }
+                    };
+                    if original.is_empty() {
+                        continue;
+                    }
+                    let cfg = minify_html::Cfg::new();
+                    let minified = minify_html::minify(&original, &cfg);
+                    let saved = original.len().saturating_sub(minified.len());
+                    if apply && minified != original {
+                        if let Err(e) = std::fs::write(&path, &minified) {
+                            eprintln!("{rel}: write error: {e}");
+                        }
+                    }
+                    total_saved.fetch_add(saved, Ordering::Relaxed);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if verbose && saved > 0 {
+                        eprintln!("{rel}: saved {saved} bytes");
+                    }
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rProcessing: {done}/{file_count} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            });
+        }
+    });
+
+    let saved = total_saved.load(Ordering::Relaxed);
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+    if apply {
+        eprintln!(
+            "Minified {} file(s), saved {} byte(s).",
+            file_count, saved
+        );
+    } else {
+        eprintln!(
+            "Dry-run: {} file(s) would save {} byte(s). Run with --apply to minify.",
+            file_count, saved
+        );
+    }
+
+    Ok(())
 }
 
 fn cmd_zap(args: Args) -> Result<(), String> {
@@ -1657,7 +1777,7 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
@@ -1665,18 +1785,19 @@ pub fn run() -> i32 {
 
     let result = match args.command.as_deref() {
         Some("check") => cmd_check(args),
+        Some("minify-html") => cmd_minify_html(args),
         Some("zap") => cmd_zap(args),
         Some("towebp") => cmd_towebp(args),
         Some("translate") => cmd_translate(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <check|zap|towebp|translate> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
             eprintln!("localize: expected subcommand (check, zap, towebp, or translate)");
-            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }

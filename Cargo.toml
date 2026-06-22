@@ -26,6 +26,7 @@ png = "0.18.1"
 zune-jpeg = "0.5.15"
 memmap2 = "0.9"
 macos-translate = { path = "../translate" }
+minify-html = { git = "https://github.com/joshuarli/minify-html.git", default-features = false }
 
 [features]
 count-alloc = []
