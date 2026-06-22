@@ -7,7 +7,6 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Semaphore;
 
 struct Args {
     command: Option<String>,
@@ -361,7 +360,7 @@ fn discover_and_index(
     (html_files, href_set)
 }
 
-async fn scan_all(
+fn scan_all(
     root: &str,
     files: &[String],
     jobs: usize,
@@ -372,55 +371,60 @@ async fn scan_all(
         return Vec::new();
     }
 
-    let sem = Arc::new(Semaphore::new(jobs));
-    let counter = Arc::new(AtomicUsize::new(0));
     let total = files.len();
+    let workers = jobs.min(files.len());
+    let all_refs = std::sync::Mutex::new(Vec::with_capacity(files.len() * 4));
+    let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let counter = AtomicUsize::new(0);
 
-    let root = Arc::new(root.to_string());
+    let root_path = Path::new(root);
     let href_set = Arc::new(href_set.clone());
-    let mut handles = Vec::with_capacity(files.len());
-    for rel in files {
-        let rel = rel.clone();
-        let root = root.clone();
-        let sem = sem.clone();
-        let counter = counter.clone();
-        let href_set = href_set.clone();
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            tokio::task::spawn_blocking(move || {
-                let path = Path::new(root.as_str()).join(&rel);
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let result = scan_file(&rel, &content, &href_set);
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if !verbose && done.is_multiple_of(16) {
-                    eprint!("\rScanning: {done}/{total} files");
-                    let _ = std::io::stderr().flush();
+
+    std::thread::scope(|s| {
+        let files: &[String] = files;
+        let all_refs: &std::sync::Mutex<Vec<MediaReference>> = &all_refs;
+        let errors: &std::sync::Mutex<Vec<String>> = &errors;
+        let counter: &AtomicUsize = &counter;
+        let index = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let index = Arc::clone(&index);
+            let href_set = href_set.clone();
+            s.spawn(move || {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    let result = scan_file(rel, &content, &href_set);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rScanning: {done}/{total} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                    if let Some(err) = &result.error {
+                        if let Ok(mut errs) = errors.lock() {
+                            errs.push(format!("{rel}: {err}"));
+                        }
+                    }
+                    if verbose && !result.references.is_empty() {
+                        eprintln!("  {rel}: {} reference(s)", result.references.len());
+                    }
+                    if let Ok(mut refs) = all_refs.lock() {
+                        refs.extend(result.references);
+                    }
                 }
-                (rel.clone(), result)
-            })
-            .await
-            .unwrap()
-        });
-        handles.push(handle);
+            });
+        }
+    });
+
+    for err in errors.into_inner().unwrap() {
+        eprintln!("\nWARNING: {err}");
     }
 
-    let mut all_refs = Vec::with_capacity(files.len() * 4);
-    for handle in handles {
-        match handle.await {
-            Ok((rel, result)) => {
-                if let Some(err) = &result.error {
-                    eprintln!("\nWARNING: {rel}: {err}");
-                }
-                if verbose && !result.references.is_empty() {
-                    eprintln!("  {rel}: {} reference(s)", result.references.len());
-                }
-                all_refs.extend(result.references);
-            }
-            Err(e) => {
-                eprintln!("\nWARNING: join error: {e}");
-            }
-        }
-    }
+    let all_refs = all_refs.into_inner().unwrap();
 
     if !verbose && total > 0 {
         eprintln!();
@@ -547,8 +551,6 @@ fn dedup_broken(refs: &[MediaReference]) -> Vec<MediaReference> {
 }
 
 fn cmd_check(args: Args) -> Result<(), String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
-
     let root = args.root.as_ref().ok_or("missing root")?;
     let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
     let include: &[String] = if args.include.is_empty() {
@@ -578,7 +580,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
     }
 
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
-    let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose, &href_set));
+    let refs = scan_all(root, &files, jobs, args.verbose, &href_set);
     let deduped = dedup_broken(&refs);
 
     if args.download {
@@ -642,7 +644,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
                 verbose: args.verbose,
                 jobs: dl_jobs,
             };
-            let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
+            let (rewritten, broken_urls) = download_and_rewrite(&file_urls, &dl_cfg);
 
             if !broken_urls.is_empty() {
                 eprintln!(
@@ -713,22 +715,26 @@ fn cmd_check(args: Args) -> Result<(), String> {
             let cleaned = Arc::new(AtomicUsize::new(0));
             let errors: Arc<std::sync::Mutex<Vec<String>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
-            rt.block_on(async {
-                let sem = Arc::new(Semaphore::new(jobs));
-                let mut handles = Vec::with_capacity(file_broken.len());
-                for rel in file_broken.keys() {
-                    let rel = rel.clone();
-                    let sem = sem.clone();
+            let clean_files: Vec<String> = file_broken.keys().cloned().collect();
+            let clean_total = clean_files.len();
+            std::thread::scope(|s| {
+                let clean_files: &[String] = &clean_files;
+                let href_set: &FxHashSet<String> = &href_set;
+                let index = Arc::new(AtomicUsize::new(0));
+                for _ in 0..jobs.min(clean_total) {
+                    let index = Arc::clone(&index);
                     let cleaned = cleaned.clone();
                     let errors = errors.clone();
-                    let href_set = href_set.clone();
-                    let root = root.to_string();
-                    let handle = tokio::spawn(async move {
-                        let _permit = sem.acquire().await.unwrap();
-                        tokio::task::spawn_blocking(move || {
-                            let path = Path::new(&root).join(&rel);
+                    s.spawn(move || {
+                        loop {
+                            let i = index.fetch_add(1, Ordering::Relaxed);
+                            if i >= clean_total {
+                                break;
+                            }
+                            let rel = &clean_files[i];
+                            let path = Path::new(root).join(rel);
                             let content = std::fs::read_to_string(&path).unwrap_or_default();
-                            match crate::rewriter::clean_html(&content, &href_set, &rel) {
+                            match crate::rewriter::clean_html(&content, &href_set, rel) {
                                 Ok(new_html) => {
                                     let tmp = path.with_extension("tmp");
                                     if let Err(e) = std::fs::write(&tmp, &new_html)
@@ -747,14 +753,8 @@ fn cmd_check(args: Args) -> Result<(), String> {
                                     errors.lock().unwrap().push(format!("{rel}: {e}"));
                                 }
                             }
-                        })
-                        .await
-                        .unwrap()
+                        }
                     });
-                    handles.push(handle);
-                }
-                for handle in handles {
-                    let _ = handle.await;
                 }
             });
 

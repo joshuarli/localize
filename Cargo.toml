@@ -5,15 +5,8 @@ edition = "2024"
 
 [dependencies]
 html5gum = "0.8"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-roots", "http1", "ring", "native-tokio"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
-http-body-util = "0.1"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-webpki-roots = "1"
-bytes = "1"
-ring = "0.17"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "time"] }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+twox-hash = "2"
 lexopt = "0.3"
 url = "2"
 glob = "0.3"

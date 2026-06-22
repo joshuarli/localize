@@ -58,12 +58,12 @@ Key design decisions for scan performance (~880ms on a 9777-file site, 2365 HTML
 
 - **HTML parsing**: `html5gum` tokenizer with span tracking (for scan detection). `lol_html` for HTML modification (element handlers, single-pass rewriting).
 - **HTML minification**: `minify-html` (HTML-only, CSS/JS features disabled). Custom parser with per-element whitespace strategies, WHATWG tag omission, entity optimization, attribute minification, and template syntax preservation.
-- **HTTP**: `hyper` (HTTP/1.1) + `rustls` with `ring` crypto + `webpki-roots` for TLS.
-- **Async runtime**: `tokio` (multi-threaded).
+- **HTTP**: `ureq` (blocking HTTP/1.1) + `native-tls` for TLS.
+- **Hashing**: `twox-hash` (xxhash64) for content-addressed asset paths.
 - **CLI**: `lexopt` for argument parsing.
 - **File walking**: `jwalk` (parallel, for scan discovery) + `walkdir` (for other commands) + `glob` for pattern filtering.
-- **Hashing**: `ring` (SHA-256 for content-addressed asset paths) + `rustc-hash` for `FxHashMap`/`FxHashSet`.
-- **Concurrency**: `tokio::sync::Semaphore` (limiting parallel downloads/rewrites) and `tokio::sync::Notify` (signaling between download and rewrite tasks).
+- **Hashing**: `twox-hash` (xxhash64 for content-addressed asset paths) + `rustc-hash` for `FxHashMap`/`FxHashSet`.
+- **Concurrency**: `std::thread::scope` + `Arc<AtomicUsize>` work-stealing for all parallel work. Download-rewrite pipelining replaced with two-phase (download all → rewrite all).
 - **URL parsing**: `url` crate for origin extraction and path handling.
 - **Image codecs**: `png` (PNG decoding), `zune-jpeg` (JPEG decoding), `zenwebp` (pure-Rust WebP encoding, quality 90).
 - **Regex**: `regex-lite` for CSS `url()` pattern matching in style attributes.
