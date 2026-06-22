@@ -33,6 +33,7 @@ struct Args {
     from_lang: Option<String>,
     to_lang: String,
     apply: bool,
+    quiet: bool,
 }
 
 impl Default for Args {
@@ -58,6 +59,7 @@ impl Default for Args {
             from_lang: None,
             to_lang: "en".into(),
             apply: false,
+            quiet: false,
         }
     }
 }
@@ -93,6 +95,7 @@ Common flags:
   --assets-dir <dir>    Asset directory [default: assets/external].
   --json                Output as JSON.
   --verbose             Verbose progress output.
+  --quiet, -q           Suppress per-file output (minify-html only).
   --jobs <n>            Max parallel workers [default: CPUs × 4].
   --help, -h            Print this help and exit.
 
@@ -113,6 +116,7 @@ Towebp flags:
 
 Minify-html flags:
   --apply               Apply minification (dry-run by default).
+  --quiet, -q           Suppress per-file savings output.
 
 Translate flags:
   --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
@@ -228,6 +232,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("apply") => {
                 args.apply = true;
+            }
+            Long("quiet") | Short('q') => {
+                args.quiet = true;
             }
             Long("from") => {
                 args.from_lang = Some(parser.value()?.string()?);
@@ -823,6 +830,7 @@ fn verify_no_remote(files: &[String], root: &str) -> Vec<String> {
 fn cmd_minify_html(args: Args) -> Result<(), String> {
     let root = args.root.as_deref().unwrap_or(".");
     let apply = args.apply;
+    let quiet = args.quiet;
     let verbose = args.verbose;
 
     let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
@@ -861,8 +869,8 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
     }
 
     let root_path = std::path::Path::new(root);
-    let counter = AtomicUsize::new(0);
     let total_saved = AtomicUsize::new(0);
+    let total_original = AtomicUsize::new(0);
     let file_count = files.len();
     let workers = jobs.min(files.len());
 
@@ -870,8 +878,8 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
 
     std::thread::scope(|s| {
         let files: &[String] = &files;
-        let counter: &AtomicUsize = &counter;
         let total_saved: &AtomicUsize = &total_saved;
+        let total_original: &AtomicUsize = &total_original;
         for _ in 0..workers {
             let index = Arc::clone(&index);
             s.spawn(move || {
@@ -892,41 +900,49 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
                     if original.is_empty() {
                         continue;
                     }
+                    let original_len = original.len();
                     let cfg = minify_html::Cfg::new();
                     let minified = minify_html::minify(&original, &cfg);
-                    let saved = original.len().saturating_sub(minified.len());
+                    let saved = original_len.saturating_sub(minified.len());
+                    total_original.fetch_add(original_len, Ordering::Relaxed);
+                    total_saved.fetch_add(saved, Ordering::Relaxed);
                     if apply && minified != original {
-                        if let Err(e) = std::fs::write(&path, &minified) {
-                            eprintln!("{rel}: write error: {e}");
+                        let tmp = path.with_extension("tmp");
+                        if let Err(e) = std::fs::write(&tmp, &minified)
+                            .map_err(|e| format!("write tmp: {e}"))
+                            .and_then(|_| {
+                                std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
+                            })
+                        {
+                            eprintln!("{rel}: {e}");
                         }
                     }
-                    total_saved.fetch_add(saved, Ordering::Relaxed);
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if verbose && saved > 0 {
-                        eprintln!("{rel}: saved {saved} bytes");
-                    }
-                    if !verbose && done.is_multiple_of(16) {
-                        eprint!("\rProcessing: {done}/{file_count} files");
-                        let _ = std::io::stderr().flush();
+                    if !quiet && saved > 0 {
+                        let pct = (saved as f64 / original_len as f64) * 100.0;
+                        eprintln!("{rel}: -{pct:.1}% ({saved} bytes)");
                     }
                 }
             });
         }
     });
 
-    let saved = total_saved.load(Ordering::Relaxed);
-    if !verbose && !files.is_empty() {
-        eprintln!();
-    }
+    let total_saved = total_saved.load(Ordering::Relaxed);
+    let total_original = total_original.load(Ordering::Relaxed);
+    let total_pct = if total_original > 0 {
+        (total_saved as f64 / total_original as f64) * 100.0
+    } else {
+        0.0
+    };
+
     if apply {
         eprintln!(
-            "Minified {} file(s), saved {} byte(s).",
-            file_count, saved
+            "Minified {} file(s), saved {} bytes ({total_pct:.1}%).",
+            file_count, total_saved
         );
     } else {
         eprintln!(
-            "Dry-run: {} file(s) would save {} byte(s). Run with --apply to minify.",
-            file_count, saved
+            "Dry-run: {} file(s) would save {} bytes ({total_pct:.1}%). Run with --apply to minify.",
+            file_count, total_saved
         );
     }
 
@@ -986,26 +1002,33 @@ fn cmd_zap(args: Args) -> Result<(), String> {
         );
     }
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
     let root_path = std::path::Path::new(root);
+    let file_count = files.len();
+    let workers = jobs.min(files.len());
 
-    let (total_matches, mut file_results, errors) = rt.block_on(async {
-        let sem = Arc::new(Semaphore::new(jobs));
-        let counter = Arc::new(AtomicUsize::new(0));
-        let file_total = files.len();
+    let total_matches = AtomicUsize::new(0);
+    let file_results = std::sync::Mutex::new(Vec::new());
+    let errors: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let done_counter = AtomicUsize::new(0);
 
-        let mut handles = Vec::with_capacity(files.len());
-        for rel in &files {
-            let rel = rel.clone();
-            let sem = sem.clone();
-            let counter = counter.clone();
-            let root_path = root_path.to_path_buf();
-            let selector = selector.clone();
-            let query = query.to_string();
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || {
-                    let path = root_path.join(&rel);
+    std::thread::scope(|s| {
+        let files: &[String] = &files;
+        let selector: &crate::zap::SimpleSelector = &selector;
+        let errors: &std::sync::Mutex<Vec<(String, String)>> = &errors;
+        let file_results: &std::sync::Mutex<Vec<(String, Vec<crate::zap::ZapMatch>)>> = &file_results;
+        let total_matches: &AtomicUsize = &total_matches;
+        let done_counter: &AtomicUsize = &done_counter;
+        let index = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let index = Arc::clone(&index);
+            s.spawn(move || {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= file_count {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     let (result, modified) = if apply {
                         match crate::rewriter::zap_html(&content, &selector, &query) {
@@ -1017,7 +1040,15 @@ fn cmd_zap(args: Args) -> Result<(), String> {
                                 Some(html),
                             ),
                             Err(e) => {
-                                return (rel.clone(), Err(e));
+                                if let Ok(mut errs) = errors.lock() {
+                                    errs.push((rel.clone(), e));
+                                }
+                                let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                if !verbose && done.is_multiple_of(16) {
+                                    eprint!("\rScanning: {done}/{file_count} files");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                continue;
                             }
                         }
                     } else {
@@ -1034,47 +1065,36 @@ fn cmd_zap(args: Args) -> Result<(), String> {
                                 std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
                             })
                         {
-                            return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                            if let Ok(mut errs) = errors.lock() {
+                                errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                            }
+                            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if !verbose && done.is_multiple_of(16) {
+                                eprint!("\rScanning: {done}/{file_count} files");
+                                let _ = std::io::stderr().flush();
+                            }
+                            continue;
                         }
                     }
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if !verbose {
-                        if done.is_multiple_of(16) {
-                            eprint!("\rScanning: {done}/{file_total} files");
+                    if !result.matches.is_empty() {
+                        total_matches.fetch_add(result.matches.len(), Ordering::Relaxed);
+                        if let Ok(mut results) = file_results.lock() {
+                            results.push((rel.clone(), result.matches));
                         }
+                    }
+                    let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rScanning: {done}/{file_count} files");
                         let _ = std::io::stderr().flush();
                     }
-                    (rel.clone(), Ok(result))
-                })
-                .await
-                .unwrap()
+                }
             });
-            handles.push(handle);
         }
-
-        let mut total_matches = 0usize;
-        let mut errors = Vec::new();
-        let mut file_results: Vec<(String, Vec<crate::zap::ZapMatch>)> = Vec::new();
-
-        for handle in handles {
-            match handle.await {
-                Ok((rel, Ok(result))) => {
-                    if !result.matches.is_empty() {
-                        total_matches += result.matches.len();
-                        file_results.push((rel, result.matches));
-                    }
-                }
-                Ok((rel, Err(e))) => {
-                    errors.push((rel, e));
-                }
-                Err(e) => {
-                    errors.push((String::new(), format!("join error: {e}")));
-                }
-            }
-        }
-
-        (total_matches, file_results, errors)
     });
+
+    let total_matches = total_matches.load(Ordering::Relaxed);
+    let mut file_results = file_results.into_inner().unwrap();
+    let errors = errors.into_inner().unwrap();
 
     if !verbose && !files.is_empty() {
         eprintln!();
@@ -1242,7 +1262,6 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
         );
     }
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
     let root_path = std::path::Path::new(root);
 
     // Phase 1: collect unique images and convert them (only when --apply).
@@ -1254,37 +1273,31 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
 
         // Scan all HTML files to collect image references.
         {
-            let sem = Arc::new(Semaphore::new(jobs));
-            let counter = Arc::new(AtomicUsize::new(0));
+            let counter = AtomicUsize::new(0);
             let file_total = files.len();
             let unique_mu = std::sync::Mutex::new(&mut unique);
+            let phase1_workers = jobs.min(files.len());
 
-            rt.block_on(async {
-                let mut handles = Vec::with_capacity(files.len());
-                for rel in &files {
-                    let rel = rel.clone();
-                    let sem = sem.clone();
-                    let root_path = root_path.to_path_buf();
-                    let handle = tokio::spawn(async move {
-                        let _permit = sem.acquire().await.unwrap();
-                        tokio::task::spawn_blocking(move || {
-                            let path = root_path.join(&rel);
+            std::thread::scope(|s| {
+                let files: &[String] = &files;
+                let counter: &AtomicUsize = &counter;
+                let unique_mu: &std::sync::Mutex<&mut FxHashSet<String>> = &unique_mu;
+                let index = Arc::new(AtomicUsize::new(0));
+                for _ in 0..phase1_workers {
+                    let index = Arc::clone(&index);
+                    s.spawn(move || {
+                        loop {
+                            let i = index.fetch_add(1, Ordering::Relaxed);
+                            if i >= file_total {
+                                break;
+                            }
+                            let rel = &files[i];
+                            let path = root_path.join(rel);
                             let content = std::fs::read_to_string(&path).unwrap_or_default();
                             let matches = crate::towebp::scan_towebp(&content);
-                            (rel, matches)
-                        })
-                        .await
-                        .unwrap()
-                    });
-                    handles.push(handle);
-                }
-
-                for handle in handles {
-                    match handle.await {
-                        Ok((rel, matches)) => {
                             for m in &matches {
                                 let (url, _desc) = split_url_descriptor(&m.url);
-                                let resolved = crate::rewriter::resolve_html_url(&rel, url);
+                                let resolved = crate::rewriter::resolve_html_url(rel, url);
                                 if let Ok(mut guard) = unique_mu.lock() {
                                     guard.insert(resolved);
                                 }
@@ -1295,10 +1308,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                 let _ = std::io::stderr().flush();
                             }
                         }
-                        Err(e) => {
-                            eprintln!("warning: scan task panicked: {e}");
-                        }
-                    }
+                    });
                 }
             });
             drop(unique_mu);
@@ -1319,27 +1329,46 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
         let counter = Arc::new(AtomicUsize::new(0));
         let convert_total = unique_images.len();
 
-        let (converted_count, failed_count, skipped_count) = rt.block_on(async {
-            let sem = Arc::new(Semaphore::new(jobs));
-            let mut handles = Vec::with_capacity(unique_images.len());
+        let converted_count = AtomicUsize::new(0);
+        let failed_count = AtomicUsize::new(0);
+        let skipped_count = AtomicUsize::new(0);
+        let failure_details: std::sync::Mutex<Vec<(String, String)>> =
+            std::sync::Mutex::new(Vec::new());
+        let phase1b_workers = jobs.min(unique_images.len());
 
-            for resolved in &unique_images {
-                let resolved = resolved.clone();
-                let sem = sem.clone();
-                let counter = counter.clone();
-                let root_path = root_path.to_path_buf();
-                let trash_root = trash_root.clone();
-                let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    tokio::task::spawn_blocking(move || {
-                        let abs_path = root_path.join(&resolved);
+        std::thread::scope(|s| {
+            let unique_images: &[String] = &unique_images;
+            let counter: &AtomicUsize = &counter;
+            let converted_count: &AtomicUsize = &converted_count;
+            let failed_count: &AtomicUsize = &failed_count;
+            let skipped_count: &AtomicUsize = &skipped_count;
+            let converted_mu: &std::sync::Mutex<&mut FxHashSet<String>> = &converted_mu;
+            let failure_details: &std::sync::Mutex<Vec<(String, String)>> = &failure_details;
+            let trash_root: &std::path::Path = &trash_root;
+            let index = Arc::new(AtomicUsize::new(0));
+            for _ in 0..phase1b_workers {
+                let index = Arc::clone(&index);
+                s.spawn(move || {
+                    loop {
+                        let i = index.fetch_add(1, Ordering::Relaxed);
+                        if i >= convert_total {
+                            break;
+                        }
+                        let resolved = &unique_images[i];
+                        let abs_path = root_path.join(resolved);
 
                         // Skip remote URLs and data URIs.
                         if resolved.starts_with("http://")
                             || resolved.starts_with("https://")
                             || resolved.starts_with("data:")
                         {
-                            return (resolved, Ok(None));
+                            skipped_count.fetch_add(1, Ordering::Relaxed);
+                            let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if !verbose && done.is_multiple_of(16) {
+                                eprint!("\rConverting: {done}/{convert_total} images");
+                                let _ = std::io::stderr().flush();
+                            }
+                            continue;
                         }
                         // If the original doesn't exist but the .webp already does
                         // (e.g. from a previous run where HTML rewriting was
@@ -1347,19 +1376,24 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                         if !abs_path.exists() {
                             let webp_path = abs_path.with_extension("webp");
                             if webp_path.exists() {
+                                if let Ok(mut guard) = converted_mu.lock() {
+                                    guard.insert(resolved.clone());
+                                }
+                                converted_count.fetch_add(1, Ordering::Relaxed);
                                 let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                                 if !verbose && done.is_multiple_of(16) {
                                     eprint!("\rConverting: {done}/{convert_total} images");
                                     let _ = std::io::stderr().flush();
                                 }
-                                return (resolved, Ok(Some(true)));
+                                continue;
                             }
+                            skipped_count.fetch_add(1, Ordering::Relaxed);
                             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             if !verbose && done.is_multiple_of(16) {
                                 eprint!("\rConverting: {done}/{convert_total} images");
                                 let _ = std::io::stderr().flush();
                             }
-                            return (resolved, Ok(None));
+                            continue;
                         }
 
                         if verbose {
@@ -1371,7 +1405,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                 if let Err(e) = std::fs::write(&webp_path, &webp_bytes) {
                                     Err(format!("write webp: {e}"))
                                 } else {
-                                    let trash_path = trash_root.join(&resolved);
+                                    let trash_path = trash_root.join(resolved);
                                     if let Some(parent) = trash_path.parent() {
                                         if let Err(e) = std::fs::create_dir_all(parent) {
                                             let _ = std::fs::remove_file(&webp_path);
@@ -1398,8 +1432,6 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                 }
                             }
                             Ok(ConvertResult::AlreadyWebp) => {
-                                // File is already WebP (detected by RIFF....WEBP header).
-                                // If it has a non-.webp extension, fix it.
                                 let already_webp_ext = abs_path
                                     .extension()
                                     .and_then(|e| e.to_str())
@@ -1410,7 +1442,6 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                 } else {
                                     let webp_path = abs_path.with_extension("webp");
                                     if webp_path.exists() {
-                                        // .webp already exists — the misnamed file is a duplicate.
                                         std::fs::remove_file(&abs_path)
                                             .map_err(|e| format!("remove duplicate: {e}"))
                                     } else if let Err(e) = std::fs::rename(&abs_path, &webp_path) {
@@ -1432,52 +1463,36 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                 if verbose {
                                     let _ = writeln!(std::io::stderr(), "OK");
                                 }
-                                (resolved, Ok(Some(true)))
+                                if let Ok(mut guard) = converted_mu.lock() {
+                                    guard.insert(resolved.clone());
+                                }
+                                converted_count.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 if verbose {
                                     let _ = writeln!(std::io::stderr(), "FAILED ({e})");
                                 }
-                                (resolved, Err(e))
+                                if let Ok(mut fd) = failure_details.lock() {
+                                    fd.push((resolved.clone(), e));
+                                }
+                                failed_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                    })
-                    .await
-                    .unwrap()
+                    }
                 });
-                handles.push(handle);
             }
-
-            let mut converted_count = 0usize;
-            let mut failed_count = 0usize;
-            let mut skipped_count = 0usize;
-            let mut failure_details: Vec<(String, String)> = Vec::new();
-            for handle in handles {
-                match handle.await {
-                    Ok((resolved, Ok(Some(true)))) => {
-                        if let Ok(mut guard) = converted_mu.lock() {
-                            guard.insert(resolved);
-                        }
-                        converted_count += 1;
-                    }
-                    Ok((_resolved, Ok(None))) => {
-                        skipped_count += 1;
-                    }
-                    Ok((resolved, Err(e))) => {
-                        failure_details.push((resolved, e));
-                        failed_count += 1;
-                    }
-                    _ => {}
-                }
-            }
-            if !failure_details.is_empty() {
-                eprintln!();
-                for (path, err) in &failure_details {
-                    eprintln!("  FAILED {path}: {err}");
-                }
-            }
-            (converted_count, failed_count, skipped_count)
         });
+
+        let converted_count = converted_count.load(Ordering::Relaxed);
+        let failed_count = failed_count.load(Ordering::Relaxed);
+        let skipped_count = skipped_count.load(Ordering::Relaxed);
+        let failure_details = failure_details.into_inner().unwrap();
+        if !failure_details.is_empty() {
+            eprintln!();
+            for (path, err) in &failure_details {
+                eprintln!("  FAILED {path}: {err}");
+            }
+        }
         drop(converted_mu);
 
         if !verbose && convert_total > 0 {
@@ -1495,28 +1510,38 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
     };
 
     // Phase 2: rewite HTML files (gated on `converted`).
-    let (total_matches, mut file_results, errors) = rt.block_on(async {
-        let sem = Arc::new(Semaphore::new(jobs));
-        let counter = Arc::new(AtomicUsize::new(0));
-        let file_total = files.len();
-        let converted = Arc::new(converted);
-        let apply_flag = apply;
+    let converted = Arc::new(converted);
+    let total_matches = AtomicUsize::new(0);
+    let file_results: std::sync::Mutex<Vec<(String, Vec<crate::towebp::WebpMatch>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let errors: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    let phase2_done = AtomicUsize::new(0);
+    let phase2_file_count = files.len();
+    let phase2_workers = jobs.min(files.len());
 
-        let mut handles = Vec::with_capacity(files.len());
-        for rel in &files {
-            let rel = rel.clone();
-            let sem = sem.clone();
-            let counter = counter.clone();
-            let root_path = root_path.to_path_buf();
-            let converted = converted.clone();
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || {
-                    let path = root_path.join(&rel);
+    std::thread::scope(|s| {
+        let files: &[String] = &files;
+        let converted: &FxHashSet<String> = &converted;
+        let total_matches: &AtomicUsize = &total_matches;
+        let file_results: &std::sync::Mutex<Vec<(String, Vec<crate::towebp::WebpMatch>)>> =
+            &file_results;
+        let errors: &std::sync::Mutex<Vec<(String, String)>> = &errors;
+        let phase2_done: &AtomicUsize = &phase2_done;
+        let index = Arc::new(AtomicUsize::new(0));
+        for _ in 0..phase2_workers {
+            let index = Arc::clone(&index);
+            s.spawn(move || {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= phase2_file_count {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     let all_matches = crate::towebp::scan_towebp(&content);
-                    if apply_flag {
-                        match crate::rewriter::towebp_html(&content, &rel, &converted) {
+                    if apply {
+                        match crate::rewriter::towebp_html(&content, rel, converted) {
                             Ok(new_html) => {
                                 let tmp = path.with_extension("tmp");
                                 if let Err(e) = std::fs::write(&tmp, &new_html)
@@ -1526,66 +1551,61 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                             .map_err(|e| format!("rename: {e}"))
                                     })
                                 {
-                                    return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                                    if let Ok(mut errs) = errors.lock() {
+                                        errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                                    }
+                                    let done = phase2_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if !verbose && done.is_multiple_of(16) {
+                                        eprint!("\rProcessing: {done}/{phase2_file_count} files");
+                                        let _ = std::io::stderr().flush();
+                                    }
+                                    continue;
                                 }
                             }
                             Err(e) => {
-                                return (rel.clone(), Err(format!("{}: {e}", path.display())));
+                                if let Ok(mut errs) = errors.lock() {
+                                    errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                                }
+                                let done = phase2_done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if !verbose && done.is_multiple_of(16) {
+                                    eprint!("\rProcessing: {done}/{phase2_file_count} files");
+                                    let _ = std::io::stderr().flush();
+                                }
+                                continue;
                             }
                         }
                     }
-                    // Filter matches for display — only show those whose resolved
-                    // path was actually converted (apply mode only).
-                    let matches: Vec<crate::towebp::WebpMatch> = if apply_flag {
+                    let matches: Vec<crate::towebp::WebpMatch> = if apply {
                         all_matches
                             .into_iter()
                             .filter(|m| {
                                 let (url, _desc) = split_url_descriptor(&m.url);
-                                let resolved = crate::rewriter::resolve_html_url(&rel, url);
+                                let resolved = crate::rewriter::resolve_html_url(rel, url);
                                 converted.contains(&resolved)
                             })
                             .collect()
                     } else {
                         all_matches
                     };
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if !verbose {
-                        if done.is_multiple_of(16) {
-                            eprint!("\rProcessing: {done}/{file_total} files");
+                    if !matches.is_empty() {
+                        total_matches.fetch_add(matches.len(), Ordering::Relaxed);
+                        if let Ok(mut results) = file_results.lock() {
+                            results.push((rel.clone(), matches));
                         }
+                    }
+                    let done = phase2_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rProcessing: {done}/{phase2_file_count} files");
                         let _ = std::io::stderr().flush();
                     }
-                    (rel.clone(), Ok(matches))
-                })
-                .await
-                .unwrap()
+                }
             });
-            handles.push(handle);
         }
-
-        let mut total_matches = 0usize;
-        let mut errors = Vec::new();
-        let mut file_results: Vec<(String, Vec<crate::towebp::WebpMatch>)> = Vec::new();
-
-        for handle in handles {
-            match handle.await {
-                Ok((rel, Ok(matches))) => {
-                    if !matches.is_empty() {
-                        total_matches += matches.len();
-                        file_results.push((rel, matches));
-                    }
-                }
-                Ok((rel, Err(e))) => {
-                    errors.push((rel, e));
-                }
-                Err(e) => {
-                    errors.push((String::new(), format!("join error: {e}")));
-                }
-            }
-        }
-
-        (total_matches, file_results, errors)
     });
+
+    let total_matches = total_matches.load(Ordering::Relaxed);
+    let mut file_results = file_results.into_inner().unwrap();
+    let errors = errors.into_inner().unwrap();
 
     if !verbose && !files.is_empty() {
         eprintln!();
