@@ -29,6 +29,9 @@ struct Args {
     // zap
     zap_tag: Option<String>,
     zap_query: Option<String>,
+    // translate
+    from_lang: Option<String>,
+    to_lang: String,
     apply: bool,
 }
 
@@ -52,6 +55,8 @@ impl Default for Args {
             referer: String::new(),
             zap_tag: None,
             zap_query: None,
+            from_lang: None,
+            to_lang: "en".into(),
             apply: false,
         }
     }
@@ -74,6 +79,10 @@ Commands:
   towebp        Replace .jpg/.jpeg/.png URL extensions with .webp in href,
                 src, and srcset attributes. Dry-run by default, --apply to
                 rewrite.
+  translate     Translate HTML text content to a target language via Apple's
+                on-device Translation framework. Extracts text, clusters by
+                element type (article body, headings, nav, sidebar), and
+                reconstructs the HTML. Dry-run by default, --apply to write.
 
 Common flags:
   --include <pattern>   Only process files matching glob pattern (repeatable).
@@ -99,12 +108,19 @@ Zap flags:
 Towebp flags:
   --apply               Apply rewrites (dry-run by default).
 
+Translate flags:
+  --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
+                        per file if omitted.
+  --to <lang>           Target language (BCP-47, default: en).
+  --apply               Apply translations (dry-run by default).
+
 Examples:
   localize check ~/mysite
   localize check ~/mysite --download
   localize check ~/mysite --clean
   localize zap p \"Copyright 2019\" ~/mysite --apply
-  localize towebp ~/mysite --apply"
+  localize towebp ~/mysite --apply
+  localize translate ~/mysite --to en --apply"
     );
 }
 
@@ -125,7 +141,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (check, zap, or towebp)".into());
+                return Err("expected subcommand (check, zap, towebp, or translate)".into());
             }
         }
     }
@@ -151,6 +167,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                     return Err("expected query string".into());
                 }
             }
+            // Root is optional — caught as a Value in the flag loop, or defaults to ".".
+        }
+        Some("translate") => {
             // Root is optional — caught as a Value in the flag loop, or defaults to ".".
         }
         _ => {
@@ -202,6 +221,12 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("apply") => {
                 args.apply = true;
+            }
+            Long("from") => {
+                args.from_lang = Some(parser.value()?.string()?);
+            }
+            Long("to") => {
+                args.to_lang = parser.value()?.string()?;
             }
             Long("help") | Short('h') => {
                 print_help();
@@ -1521,6 +1546,107 @@ fn unique_trash_path(path: &Path) -> std::path::PathBuf {
     ))
 }
 
+fn cmd_translate(args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+    let apply = args.apply;
+    let verbose = args.verbose;
+    let to_lang = &args.to_lang;
+    let from_lang = args.from_lang.as_deref();
+
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = iter_html_files(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to process", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    if apply {
+        eprintln!(
+            "Translating {} file(s) to {to_lang} sequentially...",
+            files.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: scanning {} file(s) for translatable text to {to_lang}...",
+            files.len()
+        );
+    }
+
+    let root_path = std::path::Path::new(root);
+    let mut total_segments = 0usize;
+    let mut total_translated = 0usize;
+    let mut file_count = 0usize;
+    let mut errors = Vec::new();
+
+    for rel in &files {
+        let path = root_path.join(rel);
+        match crate::translate::process_file(&path, from_lang, to_lang, apply, verbose) {
+            Ok(result) => {
+                total_segments += result.total_segments;
+                total_translated += result.translated_segments;
+                file_count += 1;
+
+                if result.total_segments > 0 {
+                    if verbose {
+                        println!("{}", result.path);
+                        for cluster in &result.clusters {
+                            println!(
+                                "  {}: {} segment(s)",
+                                cluster.kind, cluster.count
+                            );
+                        }
+                        println!();
+                    } else {
+                        eprint!("\rProcessing: {file_count}/{} files", files.len());
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push((rel.clone(), e));
+            }
+        }
+    }
+
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+
+    if !errors.is_empty() {
+        eprintln!("Errors:");
+        for (rel, err) in &errors {
+            eprintln!("  {rel}: {err}");
+        }
+    }
+
+    if apply {
+        eprintln!(
+            "Translated {} segment(s) in {} file(s).",
+            total_translated,
+            file_count
+        );
+    } else {
+        eprintln!(
+            "Dry-run: {} translatable segment(s) in {} file(s). Run with --apply to translate.",
+            total_segments,
+            file_count
+        );
+    }
+
+    Ok(())
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1542,14 +1668,15 @@ pub fn run() -> i32 {
         Some("check") => cmd_check(args),
         Some("zap") => cmd_zap(args),
         Some("towebp") => cmd_towebp(args),
+        Some("translate") => cmd_translate(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|zap|towebp|translate> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (check, zap, or towebp)");
+            eprintln!("localize: expected subcommand (check, zap, towebp, or translate)");
             eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
