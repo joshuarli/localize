@@ -10,8 +10,6 @@ use rustc_hash::FxHashMap;
 use std::ops::Range;
 use std::path::Path;
 
-static ARTICLE_SEPARATOR: &str = "\n\n===PARAGRAPH_SEPARATOR===\n\n";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SegmentKind {
     ArticleBody(usize),
@@ -502,61 +500,7 @@ fn translate_article_cluster(
         .collect();
 
     let cores: Vec<&str> = part_strs.iter().map(|(_, c, _)| c.as_str()).collect();
-    let joined = cores.join(ARTICLE_SEPARATOR);
 
-    let article_translation = match translator.translate(&joined) {
-        Ok(response) => Some(response),
-        Err(TranslationError::TimedOut { seconds, .. }) => {
-            // Timeout on first attempt — retry once. Article translations are
-            // long and the model may need a second warm-up pass.
-            if verbose {
-                eprintln!("  note: article translation timed out after {seconds}s, retrying...");
-            }
-            match translator.translate(&joined) {
-                Ok(response) => Some(response),
-                Err(e2) => {
-                    if verbose {
-                        eprintln!(
-                            "  warning: article translation retry also failed ({e2}), falling back to batch"
-                        );
-                    }
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            if verbose {
-                eprintln!("  warning: article translation failed ({e}), falling back to batch");
-            }
-            None
-        }
-    };
-
-    if let Some(response) = article_translation {
-        let translated_parts: Vec<&str> = response.target_text.split(ARTICLE_SEPARATOR).collect();
-        if translated_parts.len() == cores.len() {
-            for (i, &idx) in indices.iter().enumerate() {
-                let (prefix, _, suffix) = &part_strs[i];
-                let mut result =
-                    String::with_capacity(prefix.len() + translated_parts[i].len() + suffix.len());
-                result.push_str(prefix);
-                result.push_str(translated_parts[i]);
-                result.push_str(suffix);
-                segments[idx].translated = Some(result);
-                count += 1;
-            }
-            return count;
-        }
-        if verbose {
-            eprintln!(
-                "  note: separator split mismatch (expected {}, got {}), falling back to batch",
-                cores.len(),
-                translated_parts.len()
-            );
-        }
-    }
-
-    // Fallback: batch translate individually, with caching.
     let translated = translate_cores_cached(translator, cache, &cores);
     for (i, &idx) in indices.iter().enumerate() {
         if let Some(ref t) = translated[i] {
@@ -601,9 +545,8 @@ fn translate_batch_cluster(
         match &translated[i] {
             Some(translated_text) => {
                 let (prefix, _, suffix) = &part_strs[i];
-                let mut result = String::with_capacity(
-                    prefix.len() + translated_text.len() + suffix.len(),
-                );
+                let mut result =
+                    String::with_capacity(prefix.len() + translated_text.len() + suffix.len());
                 result.push_str(prefix);
                 result.push_str(translated_text);
                 result.push_str(suffix);
@@ -890,7 +833,8 @@ pub fn process_file(
     }
 
     let mut clusters = cluster_segments(&segments);
-    let translated_count = translate_clusters(&translator, &mut clusters, &mut segments, cache, verbose);
+    let translated_count =
+        translate_clusters(&translator, &mut clusters, &mut segments, cache, verbose);
 
     let summaries = cluster_summaries(&clusters, &segments);
 

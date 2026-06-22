@@ -101,20 +101,10 @@ Segments are grouped into clusters for translation:
 
 ### 4. Translate
 
-**Article clusters** use a join-and-split strategy for contextual quality:
-
-1. Each segment's core text (whitespace stripped) is joined with a unique
-   separator: `\n\n===PARAGRAPH_SEPARATOR===\n\n`.
-2. The joined text is submitted as a single `translate()` call — the model
-   sees the full article context.
-3. The result is split on the same separator.
-4. If the split count matches, each part is mapped back to its segment.
-5. If the split count doesn't match (separator was absorbed or altered by the
-   model), it falls back to `translate_batch()` for individual segments.
-
-**Batch clusters** use `translate_batch()` — all segments in the cluster are
-submitted together in one actor invocation for efficiency, but translated
-independently.
+Article and batch clusters both use `translate_batch()`. Each segment's core
+text is submitted as a separate request within the cluster batch, allowing the
+Apple translation wrapper to use its fastest available batch path while still
+mapping results back to their original HTML spans.
 
 **Whitespace preservation** — each segment records its surrounding whitespace
 (prefix/suffix) from the original HTML. After translation, the prefix and
@@ -160,9 +150,9 @@ skipped with a warning.
 - **No semantic HTML required** — classification works on class/id heuristics
   and tag names, so messy real-world HTML is handled, but unusual markup
   patterns may misclassify segments.
-- **Separator fragility** — the article join strategy depends on the model
-  preserving the separator string verbatim. A fallback exists but loses
-  article-level context.
+- **Per-segment article translation** — article body segments are translated
+  independently within a batch. This favors throughput and reliable span
+  mapping over full-article context.
 - **No incremental translation** — re-running on already-translated files
   will translate them again (potentially degrading quality or introducing
   drift). A future normalization pass ([defuddle](https://github.com/kepano/defuddle)) could help by
