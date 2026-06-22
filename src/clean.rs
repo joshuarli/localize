@@ -266,6 +266,26 @@ pub(crate) fn resolve_href_raw<'a>(
     scratch
 }
 
+/// Check whether a local URL resolves to a file that exists in `href_set`.
+/// Tries percent-decoded resolution first, then falls back to raw (undecoded)
+/// resolution for filesystems where filenames were written with percent-encoded
+/// bytes (e.g. `grab` preserves URL encoding on disk).
+pub(crate) fn link_exists(
+    doc_href: &str,
+    doc_is_index: bool,
+    raw_href: &str,
+    scratch: &mut String,
+    decode_buf: &mut String,
+    href_set: &FxHashSet<String>,
+) -> bool {
+    let resolved = resolve_href(doc_href, doc_is_index, raw_href, scratch, decode_buf);
+    if href_set.contains(resolved) {
+        return true;
+    }
+    let raw = resolve_href_raw(doc_href, doc_is_index, raw_href, scratch);
+    href_set.contains(raw)
+}
+
 fn tag_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
     match tag {
         b"a" | b"area" | b"link" => Some(&["href"]),
@@ -338,44 +358,30 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> C
                 if attr_name == "srcset" {
                     for (url_str, _descriptor) in parse_srcset_entries(attr_value) {
                         let url_trimmed = url_str.trim();
-                        if is_local_link(url_trimmed) {
-                            let resolved = resolve_href(
-                                doc_href,
-                                doc_is_index,
-                                url_trimmed,
-                                &mut scratch,
-                                &mut decode_buf,
-                            );
-                            if !href_set.contains(resolved) {
-                                broken.push(BrokenLink {
-                                    url: url_str.to_string(),
-                                    tag: std::str::from_utf8(tag_name)
-                                        .unwrap_or("")
-                                        .to_ascii_lowercase(),
-                                    attr: "srcset".into(),
-                                    line: line_of_offset(html, tag.span.start),
-                                });
-                            }
+                        if is_local_link(url_trimmed)
+                            && !link_exists(doc_href, doc_is_index, url_trimmed, &mut scratch, &mut decode_buf, href_set)
+                        {
+                            broken.push(BrokenLink {
+                                url: url_str.to_string(),
+                                tag: std::str::from_utf8(tag_name)
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase(),
+                                attr: "srcset".into(),
+                                line: line_of_offset(html, tag.span.start),
+                            });
                         }
                     }
-                } else if is_local_link(trimmed) {
-                    let resolved = resolve_href(
-                        doc_href,
-                        doc_is_index,
-                        trimmed,
-                        &mut scratch,
-                        &mut decode_buf,
-                    );
-                    if !href_set.contains(resolved) {
-                        broken.push(BrokenLink {
-                            url: attr_value.to_string(),
-                            tag: std::str::from_utf8(tag_name)
-                                .unwrap_or("")
-                                .to_ascii_lowercase(),
-                            attr: attr_name.to_string(),
-                            line: line_of_offset(html, tag.span.start),
-                        });
-                    }
+                } else if is_local_link(trimmed)
+                    && !link_exists(doc_href, doc_is_index, trimmed, &mut scratch, &mut decode_buf, href_set)
+                {
+                    broken.push(BrokenLink {
+                        url: attr_value.to_string(),
+                        tag: std::str::from_utf8(tag_name)
+                            .unwrap_or("")
+                            .to_ascii_lowercase(),
+                        attr: attr_name.to_string(),
+                        line: line_of_offset(html, tag.span.start),
+                    });
                 }
             }
         }

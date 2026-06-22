@@ -13,7 +13,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use crate::clean::{is_local_link, resolve_href};
+use crate::clean::{is_local_link, link_exists};
 use crate::zap::{ZapMatch, scan_html};
 
 static CSS_URL_RE: LazyLock<Regex> =
@@ -317,8 +317,7 @@ pub fn clean_html(
             {
                 let mut s = scr.borrow_mut();
                 let mut d = dec.borrow_mut();
-                let resolved = resolve_href(&dh, doc_is_index, &val, &mut s, &mut d);
-                if !hs.contains(resolved) {
+                if !link_exists(&dh, doc_is_index, &val, &mut s, &mut d, &hs) {
                     el.remove_and_keep_content();
                 }
             }
@@ -343,8 +342,7 @@ pub fn clean_html(
             {
                 let mut s = scr.borrow_mut();
                 let mut d = dec.borrow_mut();
-                let resolved = resolve_href(&dh, doc_is_index, &val, &mut s, &mut d);
-                if !hs.contains(resolved) {
+                if !link_exists(&dh, doc_is_index, &val, &mut s, &mut d, &hs) {
                     el.remove();
                 }
             }
@@ -372,8 +370,7 @@ pub fn clean_html(
                     if is_local_link(url) {
                         let mut s = scr.borrow_mut();
                         let mut d = dec.borrow_mut();
-                        let resolved = resolve_href(&dh, doc_is_index, url, &mut s, &mut d);
-                        if !hs.contains(resolved) {
+                        if !link_exists(&dh, doc_is_index, url, &mut s, &mut d, &hs) {
                             el.remove();
                             return Ok(());
                         }
@@ -396,8 +393,7 @@ pub fn clean_html(
             {
                 let mut s = scr.borrow_mut();
                 let mut d = dec.borrow_mut();
-                let resolved = resolve_href(&dh, doc_is_index, &val, &mut s, &mut d);
-                if !hs.contains(resolved) {
+                if !link_exists(&dh, doc_is_index, &val, &mut s, &mut d, &hs) {
                     el.remove();
                 }
             }
