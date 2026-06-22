@@ -39,7 +39,9 @@ fn decode_numeric_entity(s: &str) -> Option<char> {
     }
     let inner = &s[2..s.len() - 1]; // strip "&#" and ";"
     if let Some(hex) = inner.strip_prefix('x').or_else(|| inner.strip_prefix('X')) {
-        u32::from_str_radix(hex, 16).ok().and_then(std::char::from_u32)
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(std::char::from_u32)
     } else {
         inner.parse::<u32>().ok().and_then(std::char::from_u32)
     }
@@ -91,15 +93,14 @@ fn decode_url_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
                 buf.push('\'');
                 i += 6;
                 continue;
-            } else if bytes[i..].starts_with(b"&#") {
-                if let Some(semi) = bytes[i..].iter().position(|&b| b == b';') {
-                    let entity_str =
-                        std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
-                    if let Some(c) = decode_numeric_entity(entity_str) {
-                        buf.push(c);
-                        i += semi + 1;
-                        continue;
-                    }
+            } else if bytes[i..].starts_with(b"&#")
+                && let Some(semi) = bytes[i..].iter().position(|&b| b == b';')
+            {
+                let entity_str = std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
+                if let Some(c) = decode_numeric_entity(entity_str) {
+                    buf.push(c);
+                    i += semi + 1;
+                    continue;
                 }
             }
         }
@@ -136,15 +137,14 @@ fn decode_html_entities_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
                 buf.push('\'');
                 i += 6;
                 continue;
-            } else if bytes[i..].starts_with(b"&#") {
-                if let Some(semi) = bytes[i..].iter().position(|&b| b == b';') {
-                    let entity_str =
-                        std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
-                    if let Some(c) = decode_numeric_entity(entity_str) {
-                        buf.push(c);
-                        i += semi + 1;
-                        continue;
-                    }
+            } else if bytes[i..].starts_with(b"&#")
+                && let Some(semi) = bytes[i..].iter().position(|&b| b == b';')
+            {
+                let entity_str = std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
+                if let Some(c) = decode_numeric_entity(entity_str) {
+                    buf.push(c);
+                    i += semi + 1;
+                    continue;
                 }
             }
         }
@@ -640,9 +640,7 @@ mod tests {
     fn test_link_exists_with_amp_entity() {
         let mut hs = FxHashSet::default();
         // File on disk has literal &amp; — the decoded URL (with &) won't match.
-        hs.insert(
-            "_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string(),
-        );
+        hs.insert("_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string());
         let mut scratch = String::new();
         let mut decode = String::new();
         // The HTML attribute has &amp; which decodes to &
@@ -662,9 +660,7 @@ mod tests {
     fn test_link_exists_with_amp_entity_decoded_path_matches() {
         let mut hs = FxHashSet::default();
         // File on disk has the decoded &
-        hs.insert(
-            "_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf".to_string(),
-        );
+        hs.insert("_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf".to_string());
         let mut scratch = String::new();
         let mut decode = String::new();
         let exists = link_exists(
@@ -685,9 +681,7 @@ mod tests {
         // handles entities, the decoded path won't match, but the raw
         // fallback ALSO entity-decodes (for consistency), so it also won't match.
         // The real fix is to rename the disk files. This test documents current behavior.
-        hs.insert(
-            "_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string(),
-        );
+        hs.insert("_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string());
         let mut scratch = String::new();
         let mut decode = String::new();
         let exists = link_exists(

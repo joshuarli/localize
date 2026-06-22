@@ -3,8 +3,8 @@
 //! Uses html5gum for tokenization and macos-translate (Apple on-device
 //! Translation.framework) for translation.
 
-use html5gum::emitters::default::DefaultEmitter;
 use html5gum::Tokenizer;
+use html5gum::emitters::default::DefaultEmitter;
 use macos_translate::{LanguageTranslator, TranslationError, TranslationRequest};
 use std::ops::Range;
 use std::path::Path;
@@ -84,10 +84,10 @@ fn extract_attr_value(raw: &str, base_offset: usize) -> Option<(Range<usize>, St
         return None;
     }
     // Offset of after_eq within raw.
-    let after_eq_offset = eq_pos + 1 + (after_eq.as_ptr() as usize - raw[eq_pos + 1..].as_ptr() as usize);
+    let after_eq_offset =
+        eq_pos + 1 + (after_eq.as_ptr() as usize - raw[eq_pos + 1..].as_ptr() as usize);
 
-    if after_eq.starts_with('\"') {
-        let inner = &after_eq[1..];
+    if let Some(inner) = after_eq.strip_prefix('\"') {
         let end = inner.find('\"')?;
         let value = &inner[..end];
         let abs_start = base_offset + after_eq_offset + 1;
@@ -95,8 +95,7 @@ fn extract_attr_value(raw: &str, base_offset: usize) -> Option<(Range<usize>, St
             return None;
         }
         Some((abs_start..abs_start + value.len(), value.to_string()))
-    } else if after_eq.starts_with('\'') {
-        let inner = &after_eq[1..];
+    } else if let Some(inner) = after_eq.strip_prefix('\'') {
         let end = inner.find('\'')?;
         let value = &inner[..end];
         let abs_start = base_offset + after_eq_offset + 1;
@@ -242,8 +241,7 @@ fn extract_segments(html: &str) -> Vec<TextSegment> {
 
         match &token {
             html5gum::Token::StartTag(tag) => {
-                let tag_name =
-                    String::from_utf8_lossy(&tag.name[..]).to_ascii_lowercase();
+                let tag_name = String::from_utf8_lossy(&tag.name[..]).to_ascii_lowercase();
 
                 let mut classes = Vec::new();
                 let mut id = None;
@@ -271,9 +269,7 @@ fn extract_segments(html: &str) -> Vec<TextSegment> {
                         continue;
                     }
                     let raw = &html[attr.span.start..attr.span.end];
-                    if let Some((span, value)) =
-                        extract_attr_value(raw, attr.span.start)
-                    {
+                    if let Some((span, value)) = extract_attr_value(raw, attr.span.start) {
                         segments.push(TextSegment {
                             span,
                             text: value,
@@ -302,8 +298,7 @@ fn extract_segments(html: &str) -> Vec<TextSegment> {
             }
 
             html5gum::Token::EndTag(tag) => {
-                let etag_name =
-                    String::from_utf8_lossy(&tag.name[..]).to_ascii_lowercase();
+                let etag_name = String::from_utf8_lossy(&tag.name[..]).to_ascii_lowercase();
                 // Pop until we find the matching tag (handle mismatched tags).
                 while let Some(top) = tag_stack.last() {
                     if top.tag_name == etag_name {
@@ -469,10 +464,8 @@ fn translate_article_cluster(
     let joined = cores.join(ARTICLE_SEPARATOR);
 
     let translate_cores = |cores: &[&str]| -> Vec<Option<String>> {
-        let requests: Vec<TranslationRequest> = cores
-            .iter()
-            .map(|t| TranslationRequest::new(*t))
-            .collect();
+        let requests: Vec<TranslationRequest> =
+            cores.iter().map(|t| TranslationRequest::new(*t)).collect();
         let results = translator.translate_batch(&requests);
         results
             .into_iter()
@@ -486,15 +479,15 @@ fn translate_article_cluster(
             // Timeout on first attempt — retry once. Article translations are
             // long and the model may need a second warm-up pass.
             if verbose {
-                eprintln!(
-                    "  note: article translation timed out after {seconds}s, retrying..."
-                );
+                eprintln!("  note: article translation timed out after {seconds}s, retrying...");
             }
             match translator.translate(&joined) {
                 Ok(response) => Some(response),
                 Err(e2) => {
                     if verbose {
-                        eprintln!("  warning: article translation retry also failed ({e2}), falling back to batch");
+                        eprintln!(
+                            "  warning: article translation retry also failed ({e2}), falling back to batch"
+                        );
                     }
                     None
                 }
@@ -509,14 +502,12 @@ fn translate_article_cluster(
     };
 
     if let Some(response) = article_translation {
-        let translated_parts: Vec<&str> =
-            response.target_text.split(ARTICLE_SEPARATOR).collect();
+        let translated_parts: Vec<&str> = response.target_text.split(ARTICLE_SEPARATOR).collect();
         if translated_parts.len() == cores.len() {
             for (i, &idx) in indices.iter().enumerate() {
                 let (prefix, _, suffix) = &part_strs[i];
-                let mut result = String::with_capacity(
-                    prefix.len() + translated_parts[i].len() + suffix.len(),
-                );
+                let mut result =
+                    String::with_capacity(prefix.len() + translated_parts[i].len() + suffix.len());
                 result.push_str(prefix);
                 result.push_str(translated_parts[i]);
                 result.push_str(suffix);
@@ -539,8 +530,7 @@ fn translate_article_cluster(
     for (i, &idx) in indices.iter().enumerate() {
         if let Some(ref t) = translated[i] {
             let (prefix, _, suffix) = &part_strs[i];
-            let mut result =
-                String::with_capacity(prefix.len() + t.len() + suffix.len());
+            let mut result = String::with_capacity(prefix.len() + t.len() + suffix.len());
             result.push_str(prefix);
             result.push_str(t);
             result.push_str(suffix);
@@ -573,10 +563,8 @@ fn translate_batch_cluster(
 
     let cores: Vec<&str> = part_strs.iter().map(|(_, c, _)| c.as_str()).collect();
 
-    let requests: Vec<TranslationRequest> = cores
-        .iter()
-        .map(|t| TranslationRequest::new(*t))
-        .collect();
+    let requests: Vec<TranslationRequest> =
+        cores.iter().map(|t| TranslationRequest::new(*t)).collect();
     let results = translator.translate_batch(&requests);
 
     for (i, result) in results.into_iter().enumerate() {
@@ -584,9 +572,8 @@ fn translate_batch_cluster(
         match result {
             Ok(resp) => {
                 let (prefix, _, suffix) = &part_strs[i];
-                let mut result = String::with_capacity(
-                    prefix.len() + resp.target_text.len() + suffix.len(),
-                );
+                let mut result =
+                    String::with_capacity(prefix.len() + resp.target_text.len() + suffix.len());
                 result.push_str(prefix);
                 result.push_str(&resp.target_text);
                 result.push_str(suffix);
@@ -625,9 +612,7 @@ fn translate_clusters(
             ClusterKind::Article(_) => {
                 translate_article_cluster(translator, cluster, segments, verbose)
             }
-            ClusterKind::Batch => {
-                translate_batch_cluster(translator, cluster, segments, verbose)
-            }
+            ClusterKind::Batch => translate_batch_cluster(translator, cluster, segments, verbose),
         };
         total += count;
     }
@@ -642,9 +627,13 @@ fn apply_translations(html: &str, segments: &[TextSegment]) -> String {
     // Sort descending by span start so earlier spans remain valid after replacement.
     let mut replacements: Vec<(Range<usize>, &str)> = segments
         .iter()
-        .filter_map(|seg| seg.translated.as_ref().map(|t| (seg.span.clone(), t.as_str())))
+        .filter_map(|seg| {
+            seg.translated
+                .as_ref()
+                .map(|t| (seg.span.clone(), t.as_str()))
+        })
         .collect();
-    replacements.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    replacements.sort_by_key(|b| std::cmp::Reverse(b.0.start));
 
     for (span, translated) in &replacements {
         result.replace_range(span.clone(), translated);
@@ -655,10 +644,7 @@ fn apply_translations(html: &str, segments: &[TextSegment]) -> String {
 
 // ── Cluster summaries ───────────────────────────────────────────────────────
 
-fn cluster_summaries(
-    clusters: &[Cluster],
-    segments: &[TextSegment],
-) -> Vec<ClusterSummary> {
+fn cluster_summaries(clusters: &[Cluster], segments: &[TextSegment]) -> Vec<ClusterSummary> {
     clusters
         .iter()
         .map(|c| {
@@ -703,7 +689,8 @@ pub fn process_file(
         .display()
         .to_string();
 
-    let html = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let html =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
     let mut segments = extract_segments(&html);
 
@@ -802,8 +789,7 @@ pub fn process_file(
     if apply && translated_count > 0 {
         let new_html = apply_translations(&html, &segments);
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &new_html)
-            .map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
+        std::fs::write(&tmp, &new_html).map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))?;
     }
@@ -873,7 +859,10 @@ mod tests {
         let html = r#"<a href="/" title="Go home">Home</a>"#;
         let segs = extract_segments(html);
         assert_eq!(segs.len(), 2); // title attr + "Home" text
-        assert!(segs.iter().any(|s| s.text == "Go home" && matches!(s.kind, SegmentKind::AltText)));
+        assert!(
+            segs.iter()
+                .any(|s| s.text == "Go home" && matches!(s.kind, SegmentKind::AltText))
+        );
         assert!(segs.iter().any(|s| s.text == "Home"));
     }
 
@@ -887,8 +876,7 @@ mod tests {
 
     #[test]
     fn test_article_classification() {
-        let html =
-            "<div class=\"post\"><h2>Post Title</h2><p>Paragraph one.</p><p>Paragraph two.</p></div>";
+        let html = "<div class=\"post\"><h2>Post Title</h2><p>Paragraph one.</p><p>Paragraph two.</p></div>";
         let segs = extract_segments(html);
         // Title + 2 paragraphs, all should be in article context
         assert!(matches!(segs[0].kind, SegmentKind::Heading));
@@ -934,12 +922,16 @@ mod tests {
         let clusters = cluster_segments(&segs);
 
         // Should have Nav cluster and Heading cluster
-        assert!(clusters
-            .iter()
-            .any(|c| matches!(c.kind, ClusterKind::Batch) && c.segments.len() == 2));
-        assert!(clusters
-            .iter()
-            .any(|c| matches!(c.kind, ClusterKind::Batch) && c.segments.len() == 1));
+        assert!(
+            clusters
+                .iter()
+                .any(|c| matches!(c.kind, ClusterKind::Batch) && c.segments.len() == 2)
+        );
+        assert!(
+            clusters
+                .iter()
+                .any(|c| matches!(c.kind, ClusterKind::Batch) && c.segments.len() == 1)
+        );
     }
 
     #[test]

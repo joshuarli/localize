@@ -847,9 +847,7 @@ mod tests {
     #[test]
     fn test_clean_html_object_with_amp_entity() {
         let mut hs = FxHashSet::default();
-        hs.insert(
-            "_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string(),
-        );
+        hs.insert("_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string());
         let html = r#"<p><object data="../../_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf"><param name="x" value="1"></object></p>"#;
         let result = clean_html(html, &hs, "archives/3517.html/index.html").unwrap();
         assert!(
@@ -866,8 +864,7 @@ mod tests {
     fn test_clean_html_a_with_amp_entity() {
         let mut hs = FxHashSet::default();
         hs.insert("_grab/example.com/&amp;file.jpg".to_string());
-        let html =
-            r#"<a href="../../_grab/example.com/&amp;file.jpg">link</a>"#;
+        let html = r#"<a href="../../_grab/example.com/&amp;file.jpg">link</a>"#;
         let result = clean_html(html, &hs, "posts/1/index.html").unwrap();
         assert_eq!(result, "link");
     }
@@ -876,8 +873,7 @@ mod tests {
     fn test_clean_html_img_with_amp_entity() {
         let mut hs = FxHashSet::default();
         hs.insert("_grab/example.com/&amp;photo.jpg".to_string());
-        let html =
-            r#"<img src="../../_grab/example.com/&amp;photo.jpg" alt="x">"#;
+        let html = r#"<img src="../../_grab/example.com/&amp;photo.jpg" alt="x">"#;
         let result = clean_html(html, &hs, "posts/1/index.html").unwrap();
         assert!(!result.contains("<img"), "img should be removed: {result}");
     }
@@ -886,9 +882,11 @@ mod tests {
     fn test_clean_html_script_with_amp_entity() {
         let mut hs = FxHashSet::default();
         hs.insert("_grab/cdn.com/&amp;lib.js".to_string());
-        let html =
-            r#"<script src="../../_grab/cdn.com/&amp;lib.js"></script>"#;
+        let html = r#"<script src="../../_grab/cdn.com/&amp;lib.js"></script>"#;
         let result = clean_html(html, &hs, "posts/1/index.html").unwrap();
-        assert!(!result.contains("<script"), "script should be removed: {result}");
+        assert!(
+            !result.contains("<script"),
+            "script should be removed: {result}"
+        );
     }
 }

@@ -717,7 +717,8 @@ fn cmd_check(args: Args) -> Result<(), String> {
                             match crate::rewriter::clean_html(&content, &href_set, &rel) {
                                 Ok(new_html) => {
                                     let tmp = path.with_extension("tmp");
-                                    if let Err(e) = std::fs::write(&tmp, &new_html).map_err(|e| format!("write tmp: {e}"))
+                                    if let Err(e) = std::fs::write(&tmp, &new_html)
+                                        .map_err(|e| format!("write tmp: {e}"))
                                         .and_then(|_| {
                                             std::fs::rename(&tmp, &path)
                                                 .map_err(|e| format!("rename: {e}"))
@@ -776,7 +777,11 @@ fn cmd_check(args: Args) -> Result<(), String> {
     }
 
     if args.verbose {
-        let total_refs: &[MediaReference] = if args.download || args.clean { &refs } else { &deduped };
+        let total_refs: &[MediaReference] = if args.download || args.clean {
+            &refs
+        } else {
+            &deduped
+        };
         let unique_broken = total_refs.iter().filter(|r| r.broken).count();
         let remote = total_refs.len() - unique_broken;
         eprintln!(
@@ -1122,7 +1127,8 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
 
     // Phase 1: collect unique images and convert them (only when --apply).
     let converted: FxHashSet<String> = if apply {
-        let mut unique: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(files.len(), Default::default());
+        let mut unique: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(files.len(), Default::default());
         // Keyed by resolved filesystem path so the same image referenced from
         // multiple HTML files is deduplicated.
 
@@ -1287,9 +1293,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                         // .webp already exists — the misnamed file is a duplicate.
                                         std::fs::remove_file(&abs_path)
                                             .map_err(|e| format!("remove duplicate: {e}"))
-                                    } else if let Err(e) =
-                                        std::fs::rename(&abs_path, &webp_path)
-                                    {
+                                    } else if let Err(e) = std::fs::rename(&abs_path, &webp_path) {
                                         Err(format!("rename to webp: {e}"))
                                     } else {
                                         Ok(())
@@ -1601,10 +1605,7 @@ fn cmd_translate(args: Args) -> Result<(), String> {
                     if verbose {
                         println!("{}", result.path);
                         for cluster in &result.clusters {
-                            println!(
-                                "  {}: {} segment(s)",
-                                cluster.kind, cluster.count
-                            );
+                            println!("  {}: {} segment(s)", cluster.kind, cluster.count);
                         }
                         println!();
                     } else {
@@ -1633,14 +1634,12 @@ fn cmd_translate(args: Args) -> Result<(), String> {
     if apply {
         eprintln!(
             "Translated {} segment(s) in {} file(s).",
-            total_translated,
-            file_count
+            total_translated, file_count
         );
     } else {
         eprintln!(
             "Dry-run: {} translatable segment(s) in {} file(s). Run with --apply to translate.",
-            total_segments,
-            file_count
+            total_segments, file_count
         );
     }
 
