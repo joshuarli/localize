@@ -2352,6 +2352,8 @@ fn cmd_translate(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
+    apple_translate_rs_sync::set_worker_num_engines(2);
+
     if apply {
         eprintln!(
             "Translating {} file(s) to {to_lang} sequentially...",
