@@ -6,6 +6,7 @@
 use apple_translate_rs_sync::{LanguageTranslator, TranslationError, TranslationRequest};
 use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
+use rustc_hash::FxHashMap;
 use std::ops::Range;
 use std::path::Path;
 
@@ -442,10 +443,50 @@ fn cluster_segments(segments: &[TextSegment]) -> Vec<Cluster> {
 
 // ── Translation ─────────────────────────────────────────────────────────────
 
+/// Batch-translate cores, checking `cache` first. Returns one `Option` per core;
+/// `None` means the translation failed (or was not attempted).
+fn translate_cores_cached(
+    translator: &LanguageTranslator,
+    cache: &mut FxHashMap<String, String>,
+    cores: &[&str],
+) -> Vec<Option<String>> {
+    let mut results: Vec<Option<String>> = vec![None; cores.len()];
+    let mut uncached: Vec<(usize, &str)> = Vec::new();
+
+    for (i, core) in cores.iter().enumerate() {
+        if let Some(cached) = cache.get(*core) {
+            results[i] = Some(cached.clone());
+        } else {
+            uncached.push((i, core));
+        }
+    }
+
+    if uncached.is_empty() {
+        return results;
+    }
+
+    let requests: Vec<TranslationRequest> = uncached
+        .iter()
+        .map(|(_, t)| TranslationRequest::new(*t))
+        .collect();
+    let batch_results = translator.translate_batch(&requests);
+
+    for (j, result) in batch_results.into_iter().enumerate() {
+        let (i, core) = uncached[j];
+        if let Ok(resp) = result {
+            cache.insert(core.to_string(), resp.target_text.clone());
+            results[i] = Some(resp.target_text);
+        }
+    }
+
+    results
+}
+
 fn translate_article_cluster(
     translator: &LanguageTranslator,
     cluster: &Cluster,
     segments: &mut [TextSegment],
+    cache: &mut FxHashMap<String, String>,
     verbose: bool,
 ) -> usize {
     let mut count = 0;
@@ -462,16 +503,6 @@ fn translate_article_cluster(
 
     let cores: Vec<&str> = part_strs.iter().map(|(_, c, _)| c.as_str()).collect();
     let joined = cores.join(ARTICLE_SEPARATOR);
-
-    let translate_cores = |cores: &[&str]| -> Vec<Option<String>> {
-        let requests: Vec<TranslationRequest> =
-            cores.iter().map(|t| TranslationRequest::new(*t)).collect();
-        let results = translator.translate_batch(&requests);
-        results
-            .into_iter()
-            .map(|r| r.ok().map(|resp| resp.target_text))
-            .collect()
-    };
 
     let article_translation = match translator.translate(&joined) {
         Ok(response) => Some(response),
@@ -525,8 +556,8 @@ fn translate_article_cluster(
         }
     }
 
-    // Fallback: batch translate individually.
-    let translated = translate_cores(&cores);
+    // Fallback: batch translate individually, with caching.
+    let translated = translate_cores_cached(translator, cache, &cores);
     for (i, &idx) in indices.iter().enumerate() {
         if let Some(ref t) = translated[i] {
             let (prefix, _, suffix) = &part_strs[i];
@@ -548,6 +579,7 @@ fn translate_batch_cluster(
     translator: &LanguageTranslator,
     cluster: &Cluster,
     segments: &mut [TextSegment],
+    cache: &mut FxHashMap<String, String>,
     verbose: bool,
 ) -> usize {
     let mut count = 0;
@@ -563,35 +595,24 @@ fn translate_batch_cluster(
 
     let cores: Vec<&str> = part_strs.iter().map(|(_, c, _)| c.as_str()).collect();
 
-    let requests: Vec<TranslationRequest> =
-        cores.iter().map(|t| TranslationRequest::new(*t)).collect();
-    let results = translator.translate_batch(&requests);
+    let translated = translate_cores_cached(translator, cache, &cores);
 
-    for (i, result) in results.into_iter().enumerate() {
-        let &idx = &indices[i];
-        match result {
-            Ok(resp) => {
+    for (i, &idx) in indices.iter().enumerate() {
+        match &translated[i] {
+            Some(translated_text) => {
                 let (prefix, _, suffix) = &part_strs[i];
-                let mut result =
-                    String::with_capacity(prefix.len() + resp.target_text.len() + suffix.len());
+                let mut result = String::with_capacity(
+                    prefix.len() + translated_text.len() + suffix.len(),
+                );
                 result.push_str(prefix);
-                result.push_str(&resp.target_text);
+                result.push_str(translated_text);
                 result.push_str(suffix);
                 segments[idx].translated = Some(result);
                 count += 1;
             }
-            Err(e) => {
+            None => {
                 if verbose {
-                    match &e {
-                        TranslationError::TimedOut { operation, seconds } => {
-                            eprintln!(
-                                "  warning: {operation} timed out after {seconds}s for segment"
-                            );
-                        }
-                        _ => {
-                            eprintln!("  warning: translation failed for segment: {e}");
-                        }
-                    }
+                    eprintln!("  warning: translation failed for segment");
                 }
             }
         }
@@ -604,15 +625,18 @@ fn translate_clusters(
     translator: &LanguageTranslator,
     clusters: &mut [Cluster],
     segments: &mut [TextSegment],
+    cache: &mut FxHashMap<String, String>,
     verbose: bool,
 ) -> usize {
     let mut total = 0;
     for cluster in clusters {
         let count = match &cluster.kind {
             ClusterKind::Article(_) => {
-                translate_article_cluster(translator, cluster, segments, verbose)
+                translate_article_cluster(translator, cluster, segments, cache, verbose)
             }
-            ClusterKind::Batch => translate_batch_cluster(translator, cluster, segments, verbose),
+            ClusterKind::Batch => {
+                translate_batch_cluster(translator, cluster, segments, cache, verbose)
+            }
         };
         total += count;
     }
@@ -681,6 +705,7 @@ pub fn process_file(
     from_lang: Option<&str>,
     to_lang: &str,
     apply: bool,
+    cache: &mut FxHashMap<String, String>,
     verbose: bool,
 ) -> Result<ProcessFileResult, String> {
     let rel = path
@@ -774,7 +799,7 @@ pub fn process_file(
     }
 
     let mut clusters = cluster_segments(&segments);
-    let translated_count = translate_clusters(&translator, &mut clusters, &mut segments, verbose);
+    let translated_count = translate_clusters(&translator, &mut clusters, &mut segments, cache, verbose);
 
     let summaries = cluster_summaries(&clusters, &segments);
 

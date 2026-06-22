@@ -2369,10 +2369,11 @@ fn cmd_translate(args: Args) -> Result<(), String> {
     let mut total_translated = 0usize;
     let mut file_count = 0usize;
     let mut errors = Vec::new();
+    let mut cache: FxHashMap<String, String> = FxHashMap::default();
 
     for rel in &files {
         let path = root_path.join(rel);
-        match crate::translate::process_file(&path, from_lang, to_lang, apply, verbose) {
+        match crate::translate::process_file(&path, from_lang, to_lang, apply, &mut cache, verbose) {
             Ok(result) => {
                 total_segments += result.total_segments;
                 total_translated += result.translated_segments;
