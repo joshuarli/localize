@@ -490,17 +490,17 @@ fn resolve_relative(file_path: &str, url: &str) -> String {
 }
 
 /// Deduplicate broken-local-url entries by resolved path, keeping the first occurrence.
-fn dedup_broken(refs: Vec<MediaReference>) -> Vec<MediaReference> {
+fn dedup_broken(refs: &[MediaReference]) -> Vec<MediaReference> {
     let mut seen = FxHashSet::default();
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
         if r.broken {
             let resolved = resolve_relative(&r.file_path, &r.url);
             if seen.insert(resolved) {
-                out.push(r);
+                out.push(r.clone());
             }
         } else {
-            out.push(r);
+            out.push(r.clone());
         }
     }
     out
@@ -539,7 +539,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
 
     eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
     let refs = rt.block_on(scan_all(root, &files, jobs, args.verbose, &href_set));
-    let refs = dedup_broken(refs);
+    let deduped = dedup_broken(&refs);
 
     if args.download {
         // Filter to remote URLs (local broken URLs can't be downloaded).
@@ -735,12 +735,12 @@ fn cmd_check(args: Args) -> Result<(), String> {
 
     if !args.download && !args.clean {
         if args.json {
-            print_json(&refs);
+            print_json(&deduped);
         } else {
-            print_human(&refs);
+            print_human(&deduped);
         }
-        let broken = refs.iter().filter(|r| r.broken).count();
-        let remote = refs.len() - broken;
+        let broken = deduped.iter().filter(|r| r.broken).count();
+        let remote = deduped.len() - broken;
         eprintln!(
             "Dry-run: {} broken-local-url, {} remote-url in {} file(s).",
             broken,
@@ -750,11 +750,12 @@ fn cmd_check(args: Args) -> Result<(), String> {
     }
 
     if args.verbose {
-        let unique_broken = refs.iter().filter(|r| r.broken).count();
-        let remote = refs.len() - unique_broken;
+        let total_refs: &[MediaReference] = if args.download || args.clean { &refs } else { &deduped };
+        let unique_broken = total_refs.iter().filter(|r| r.broken).count();
+        let remote = total_refs.len() - unique_broken;
         eprintln!(
             "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
-            refs.len(),
+            total_refs.len(),
             files.len(),
             unique_broken,
             remote,

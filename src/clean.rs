@@ -32,8 +32,22 @@ pub(crate) fn is_local_link(url: &str) -> bool {
     !is_external_link(url)
 }
 
-/// Percent-decode into the provided scratch buffer. Returns the decoded slice.
-fn percent_decode_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
+/// Decode numeric HTML entities like `&#123;` or `&#x1F600;`.
+fn decode_numeric_entity(s: &str) -> Option<char> {
+    if s.len() < 4 || !s.ends_with(';') {
+        return None;
+    }
+    let inner = &s[2..s.len() - 1]; // strip "&#" and ";"
+    if let Some(hex) = inner.strip_prefix('x').or_else(|| inner.strip_prefix('X')) {
+        u32::from_str_radix(hex, 16).ok().and_then(std::char::from_u32)
+    } else {
+        inner.parse::<u32>().ok().and_then(std::char::from_u32)
+    }
+}
+
+/// Decode percent-encoding and common HTML entities into the provided buffer.
+/// Returns the decoded slice.
+fn decode_url_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
     buf.clear();
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -55,6 +69,83 @@ fn percent_decode_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
                 buf.push((hi << 4 | lo) as char);
                 i += 3;
                 continue;
+            }
+        } else if bytes[i] == b'&' {
+            if bytes[i..].starts_with(b"&amp;") {
+                buf.push('&');
+                i += 5;
+                continue;
+            } else if bytes[i..].starts_with(b"&lt;") {
+                buf.push('<');
+                i += 4;
+                continue;
+            } else if bytes[i..].starts_with(b"&gt;") {
+                buf.push('>');
+                i += 4;
+                continue;
+            } else if bytes[i..].starts_with(b"&quot;") {
+                buf.push('"');
+                i += 6;
+                continue;
+            } else if bytes[i..].starts_with(b"&apos;") {
+                buf.push('\'');
+                i += 6;
+                continue;
+            } else if bytes[i..].starts_with(b"&#") {
+                if let Some(semi) = bytes[i..].iter().position(|&b| b == b';') {
+                    let entity_str =
+                        std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
+                    if let Some(c) = decode_numeric_entity(entity_str) {
+                        buf.push(c);
+                        i += semi + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        buf.push(bytes[i] as char);
+        i += 1;
+    }
+    buf
+}
+
+/// Decode HTML entities only (no percent-decoding) into the provided buffer.
+fn decode_html_entities_into<'a>(input: &str, buf: &'a mut String) -> &'a str {
+    buf.clear();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if bytes[i..].starts_with(b"&amp;") {
+                buf.push('&');
+                i += 5;
+                continue;
+            } else if bytes[i..].starts_with(b"&lt;") {
+                buf.push('<');
+                i += 4;
+                continue;
+            } else if bytes[i..].starts_with(b"&gt;") {
+                buf.push('>');
+                i += 4;
+                continue;
+            } else if bytes[i..].starts_with(b"&quot;") {
+                buf.push('"');
+                i += 6;
+                continue;
+            } else if bytes[i..].starts_with(b"&apos;") {
+                buf.push('\'');
+                i += 6;
+                continue;
+            } else if bytes[i..].starts_with(b"&#") {
+                if let Some(semi) = bytes[i..].iter().position(|&b| b == b';') {
+                    let entity_str =
+                        std::str::from_utf8(&bytes[i..=i + semi]).unwrap_or("");
+                    if let Some(c) = decode_numeric_entity(entity_str) {
+                        buf.push(c);
+                        i += semi + 1;
+                        continue;
+                    }
+                }
             }
         }
         buf.push(bytes[i] as char);
@@ -79,14 +170,21 @@ pub(crate) fn resolve_href<'a>(
 ) -> &'a str {
     let trimmed = raw_href.trim();
 
-    // Strip fragment and query from the raw string, matching hyperlink's
-    // approach: `%23` must survive decoding as a literal `#` in the path.
-    let qs = trimmed.find(&['?', '#'][..]).unwrap_or(trimmed.len());
-    let raw_path = &trimmed[..qs];
+    // Entity-decode HTML entities FIRST so that &#64; → @ before fragment
+    // stripping sees the raw # in &#64; as a fragment separator.
+    // Use scratch for the entity-decoded intermediate.
+    let decoded = decode_html_entities_into(trimmed, scratch);
 
-    // Percent-decode only the path portion.
-    let path = percent_decode_into(raw_path, decode_buf);
+    // Strip fragment and query from the entity-decoded string.
+    // `%23` must survive here as a literal `#` in the path; it will be
+    // percent-decoded in the next step.
+    let qs = decoded.find(&['?', '#'][..]).unwrap_or(decoded.len());
+    let raw_path = &decoded[..qs];
 
+    // Percent-decode the path portion into decode_buf.
+    let path = decode_url_into(raw_path, decode_buf);
+
+    // Now scratch can be reused for the resolution output.
     scratch.clear();
 
     // External link or absolute path: replace base entirely.
@@ -107,7 +205,6 @@ pub(crate) fn resolve_href<'a>(
 
     // Handle empty path (self-reference).
     if path.is_empty() {
-        // Strip trailing slash from index pages.
         if scratch.ends_with('/') {
             scratch.pop();
         }
@@ -158,8 +255,19 @@ pub(crate) fn resolve_href_raw<'a>(
 ) -> &'a str {
     let trimmed = raw_href.trim();
 
-    let qs = trimmed.find(&['?', '#'][..]).unwrap_or(trimmed.len());
-    let raw_path = &trimmed[..qs];
+    // Entity-decode HTML entities FIRST so that &#64; → @ before fragment
+    // stripping sees the raw # in &#64; as a fragment separator.
+    let mut entity_buf;
+    let decoded: &str = if trimmed.contains('&') {
+        entity_buf = String::with_capacity(trimmed.len());
+        decode_html_entities_into(trimmed, &mut entity_buf);
+        &entity_buf
+    } else {
+        trimmed
+    };
+
+    let qs = decoded.find(&['?', '#'][..]).unwrap_or(decoded.len());
+    let raw_path = &decoded[..qs];
 
     scratch.clear();
 
@@ -410,5 +518,187 @@ mod tests {
             &mut decode,
         );
         assert_eq!(result, "material/1246.html");
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_amp_entity() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "archives/3517.html",
+            true,
+            "../../_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(
+            result,
+            "_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf"
+        );
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_lt_gt_entities() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "../files/&lt;readme&gt;.pdf",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, "files/<readme>.pdf");
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_quot_entity() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "&quot;quoted&quot;.jpg",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, r#"dir/"quoted".jpg"#);
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_numeric_entity() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "file&#64;at.pdf",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, "dir/file@at.pdf");
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_hex_numeric_entity() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "file&#x40;at.pdf",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, "dir/file@at.pdf");
+    }
+
+    #[test]
+    fn test_resolve_href_decodes_entity_and_percent_together() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "&amp;name=%20value.jpg",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, "dir/&name= value.jpg");
+    }
+
+    #[test]
+    fn test_resolve_href_raw_decodes_amp_entity() {
+        let mut scratch = String::new();
+        let result = resolve_href_raw(
+            "archives/3517.html",
+            true,
+            "../../_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf",
+            &mut scratch,
+        );
+        assert_eq!(
+            result,
+            "_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf"
+        );
+    }
+
+    #[test]
+    fn test_resolve_href_bare_ampersand_unchanged() {
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let result = resolve_href(
+            "dir/doc.html",
+            false,
+            "file&name.jpg",
+            &mut scratch,
+            &mut decode,
+        );
+        assert_eq!(result, "dir/file&name.jpg");
+    }
+
+    #[test]
+    fn test_link_exists_with_amp_entity() {
+        let mut hs = FxHashSet::default();
+        // File on disk has literal &amp; — the decoded URL (with &) won't match.
+        hs.insert(
+            "_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string(),
+        );
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        // The HTML attribute has &amp; which decodes to &
+        let exists = link_exists(
+            "archives/3517.html",
+            true,
+            "../../_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf",
+            &mut scratch,
+            &mut decode,
+            &hs,
+        );
+        // The decoded URL (with &) does NOT match the disk file (with &amp;)
+        assert!(!exists);
+    }
+
+    #[test]
+    fn test_link_exists_with_amp_entity_decoded_path_matches() {
+        let mut hs = FxHashSet::default();
+        // File on disk has the decoded &
+        hs.insert(
+            "_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf".to_string(),
+        );
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let exists = link_exists(
+            "archives/3517.html",
+            true,
+            "../../_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf",
+            &mut scratch,
+            &mut decode,
+            &hs,
+        );
+        assert!(exists);
+    }
+
+    #[test]
+    fn test_link_exists_with_amp_entity_raw_fallback() {
+        let mut hs = FxHashSet::default();
+        // File on disk has literal &amp; in path. When percent_decode_into
+        // handles entities, the decoded path won't match, but the raw
+        // fallback ALSO entity-decodes (for consistency), so it also won't match.
+        // The real fix is to rename the disk files. This test documents current behavior.
+        hs.insert(
+            "_grab/tudou.com/v/ZmBu2R6WuJk/&amp;resourceId=0_05_05_99/v.swf".to_string(),
+        );
+        let mut scratch = String::new();
+        let mut decode = String::new();
+        let exists = link_exists(
+            "archives/3517.html",
+            true,
+            "../../_grab/tudou.com/v/ZmBu2R6WuJk/&resourceId=0_05_05_99/v.swf",
+            &mut scratch,
+            &mut decode,
+            &hs,
+        );
+        // The URL already has & (no entity to decode), and the disk has &amp; — no match.
+        assert!(!exists);
     }
 }
