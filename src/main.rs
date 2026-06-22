@@ -1,4 +1,5 @@
 mod alloc;
+mod bundle_css;
 mod clean;
 mod cli;
 mod downloader;

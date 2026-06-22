@@ -3,6 +3,7 @@ use crate::scanner::{MediaReference, is_remote_url, scan_file};
 use crate::webp_encode::ConvertResult;
 use lexopt::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ struct Args {
     quiet: bool,
     // extract-css
     dir: String,
+    // bundle-css
+    bundle_dir: String,
 }
 
 impl Default for Args {
@@ -62,6 +65,7 @@ impl Default for Args {
             apply: false,
             quiet: false,
             dir: "localized-css".into(),
+            bundle_dir: "bundle".into(),
         }
     }
 }
@@ -78,6 +82,10 @@ Commands:
                 With --download, fetch remote assets and rewrite HTML to use
                 local paths.  With --clean, fix broken local links by
                 unwrapping dead <a> tags and removing dead resource elements.
+  bundle-css    Bundle all <link rel=\"stylesheet\"> CSS files across the site
+                into a single monolithic content-addressed .css file, then
+                rewrite every HTML file to reference the single bundle.
+                Dry-run by default, --apply to write.
   extract-css   Extract inline <style> CSS blocks into separate .css files
                 and replace them with <link rel=\"stylesheet\"> tags in <head>.
                 Dry-run by default, --apply to write.
@@ -123,6 +131,10 @@ Minify-html flags:
   --apply               Apply minification (dry-run by default).
   --quiet, -q           Suppress per-file savings output.
 
+Bundle-css flags:
+  --apply               Apply bundling (dry-run by default).
+  --bundle-dir <dir>    Output directory for the bundle [default: bundle].
+
 Extract-css flags:
   --apply               Apply extraction (dry-run by default).
   -d, --dir <dir>       Output directory for CSS files [default: localized-css].
@@ -140,6 +152,7 @@ Examples:
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply
   localize minify-html ~/mysite --apply
+  localize bundle-css ~/mysite --apply
   localize extract-css ~/mysite --apply
   localize translate ~/mysite --to en --apply"
     );
@@ -248,6 +261,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Short('d') | Long("dir") => {
                 args.dir = parser.value()?.string()?;
+            }
+            Long("bundle-dir") => {
+                args.bundle_dir = parser.value()?.string()?;
             }
             Long("from") => {
                 args.from_lang = Some(parser.value()?.string()?);
@@ -957,6 +973,278 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
         eprintln!(
             "Dry-run: {} file(s) would save {} bytes ({total_pct:.1}%). Run with --apply to minify.",
             file_count, total_saved
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_bundle_css(args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+    let apply = args.apply;
+    let verbose = args.verbose;
+    let bundle_dir = &args.bundle_dir;
+
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+    let jobs = if args.jobs == 0 {
+        num_cpus() * 4
+    } else {
+        args.jobs
+    };
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = collect_html_depth_first(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to process", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    // Phase 1: scan all HTML files for <link rel="stylesheet"> tags, collect
+    // unique CSS paths and per-file link spans.
+    eprintln!(
+        "Scanning {} file(s) for stylesheet links with {jobs} workers...",
+        files.len()
+    );
+
+    let root_path = std::path::Path::new(root);
+    let file_count = files.len();
+    let workers = jobs.min(files.len());
+
+    let unique_css: std::sync::Mutex<BTreeSet<String>> =
+        std::sync::Mutex::new(BTreeSet::new());
+    let per_file: std::sync::Mutex<Vec<(String, Vec<crate::bundle_css::CssLink>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let done_counter = AtomicUsize::new(0);
+
+    let _ = crossbeam::thread::scope(|s| {
+        let files: &[String] = &files;
+        let unique_css: &std::sync::Mutex<BTreeSet<String>> = &unique_css;
+        let per_file: &std::sync::Mutex<Vec<(String, Vec<crate::bundle_css::CssLink>)>> = &per_file;
+        let done_counter: &AtomicUsize = &done_counter;
+        let index = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let index = Arc::clone(&index);
+            s.spawn(move |_| {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= file_count {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+                    let links = crate::bundle_css::find_stylesheet_links(&content);
+
+                    // Collect unique resolved CSS paths for bundlable links.
+                    let mut resolved_paths: Vec<String> = Vec::new();
+                    for link in &links {
+                        if link.bundlable {
+                            let resolved = crate::bundle_css::resolve_css_path(rel, &link.href);
+                            resolved_paths.push(resolved);
+                        }
+                    }
+
+                    if !resolved_paths.is_empty() {
+                        if let Ok(mut css_set) = unique_css.lock() {
+                            for p in resolved_paths {
+                                css_set.insert(p);
+                            }
+                        }
+                    }
+
+                    if !links.is_empty() {
+                        if let Ok(mut pf) = per_file.lock() {
+                            pf.push((rel.clone(), links));
+                        }
+                    }
+
+                    let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rScanning: {done}/{file_count} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            });
+        }
+    });
+
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+
+    let unique_css = unique_css.into_inner().unwrap();
+    let per_file = per_file.into_inner().unwrap();
+
+    eprintln!(
+        "Found {} unique CSS file(s) to bundle across {} HTML file(s).",
+        unique_css.len(),
+        per_file.iter().filter(|(_, links)| links.iter().any(|l| l.bundlable)).count(),
+    );
+
+    if unique_css.is_empty() {
+        eprintln!("No local CSS files to bundle.");
+        return Ok(());
+    }
+
+    // Phase 2: concatenate, hash, and write the bundle.
+    let bundle_result = crate::bundle_css::bundle_css_files(root_path, &unique_css, bundle_dir)
+        .map_err(|e| format!("failed to create bundle: {e}"))?;
+
+    let bundle_rel = &bundle_result.bundle_rel;
+    let bundle_disk_path = root_path.join(bundle_rel);
+    let bundle_size = bundle_result.concatenated.len();
+
+    if apply {
+        if let Some(parent) = bundle_disk_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&bundle_disk_path, &bundle_result.concatenated)
+            .map_err(|e| format!("failed to write bundle: {e}"))?;
+        eprintln!(
+            "Wrote bundle ({:.1} KB) to ./{}",
+            bundle_size as f64 / 1024.0,
+            bundle_rel,
+        );
+    } else {
+        eprintln!(
+            "Dry-run: would write bundle ({:.1} KB) to ./{}",
+            bundle_size as f64 / 1024.0,
+            bundle_rel,
+        );
+    }
+
+    // Phase 3: rewrite each HTML file that has bundlable links.
+    if apply {
+        eprintln!(
+            "Rewriting {} file(s) with {jobs} workers...",
+            per_file.len()
+        );
+
+        let rewrite_count = AtomicUsize::new(0);
+        let rewrite_errors: std::sync::Mutex<Vec<(String, String)>> =
+            std::sync::Mutex::new(Vec::new());
+        let rewrite_done = AtomicUsize::new(0);
+
+        let _ = crossbeam::thread::scope(|s| {
+            let per_file: &[(String, Vec<crate::bundle_css::CssLink>)] = &per_file;
+            let bundle_rel: &str = bundle_rel;
+            let rewrite_count: &AtomicUsize = &rewrite_count;
+            let rewrite_errors: &std::sync::Mutex<Vec<(String, String)>> = &rewrite_errors;
+            let rewrite_done: &AtomicUsize = &rewrite_done;
+            let index = Arc::new(AtomicUsize::new(0));
+            for _ in 0..workers {
+                let index = Arc::clone(&index);
+                s.spawn(move |_| {
+                    loop {
+                        let i = index.fetch_add(1, Ordering::Relaxed);
+                        if i >= per_file.len() {
+                            break;
+                        }
+                        let (rel, links) = &per_file[i];
+                        let path = root_path.join(rel);
+
+                        let bundlable_spans: Vec<std::ops::Range<usize>> = links
+                            .iter()
+                            .filter(|l| l.bundlable)
+                            .map(|l| l.span.clone())
+                            .collect();
+
+                        if bundlable_spans.is_empty() {
+                            let done = rewrite_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if !verbose && done.is_multiple_of(16) {
+                                eprint!("\rRewriting: {done}/{} files", per_file.len());
+                                let _ = std::io::stderr().flush();
+                            }
+                            continue;
+                        }
+
+                        let content = std::fs::read_to_string(&path).unwrap_or_default();
+                        let bundle_href = crate::bundle_css::compute_relative_path(
+                            rel,
+                            bundle_rel,
+                        );
+                        let modified = crate::bundle_css::rewrite_html_for_bundle(
+                            &content,
+                            &bundlable_spans,
+                            &bundle_href,
+                        );
+
+                        let tmp = path.with_extension("tmp");
+                        if let Err(e) = std::fs::write(&tmp, &modified)
+                            .map_err(|e| format!("write tmp: {e}"))
+                            .and_then(|_| {
+                                std::fs::rename(&tmp, &path)
+                                    .map_err(|e| format!("rename: {e}"))
+                            })
+                        {
+                            if let Ok(mut errs) = rewrite_errors.lock() {
+                                errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                            }
+                        } else {
+                            rewrite_count.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        let done = rewrite_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !verbose && done.is_multiple_of(16) {
+                            eprint!("\rRewriting: {done}/{} files", per_file.len());
+                            let _ = std::io::stderr().flush();
+                        }
+                    }
+                });
+            }
+        });
+
+        if !verbose && !per_file.is_empty() {
+            eprintln!();
+        }
+
+        let rewrite_errors = rewrite_errors.into_inner().unwrap();
+        if !rewrite_errors.is_empty() {
+            eprintln!("Errors:");
+            for (rel, err) in &rewrite_errors {
+                eprintln!("  {rel}: {err}");
+            }
+        }
+
+        let rewrote = rewrite_count.load(Ordering::Relaxed);
+        eprintln!(
+            "Rewrote {} file(s), bundle at ./{}",
+            rewrote,
+            bundle_rel,
+        );
+    } else {
+        // Dry-run: show what would change per file.
+        for (rel, links) in &per_file {
+            let bundlable: Vec<_> = links.iter().filter(|l| l.bundlable).collect();
+            if bundlable.is_empty() {
+                continue;
+            }
+            let bundle_href = crate::bundle_css::compute_relative_path(
+                rel,
+                bundle_rel,
+            );
+            println!("./{rel}");
+            for link in &bundlable {
+                let resolved = crate::bundle_css::resolve_css_path(rel, &link.href);
+                println!("  - {resolved}");
+            }
+            println!("  + <link rel=\"stylesheet\" href=\"{bundle_href}\">");
+            println!();
+        }
+        eprintln!(
+            "Dry-run: {} unique CSS file(s) would bundle into ./{}. Run with --apply to write.",
+            unique_css.len(),
+            bundle_rel,
         );
     }
 
@@ -2100,7 +2388,7 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
@@ -2108,6 +2396,7 @@ pub fn run() -> i32 {
 
     let result = match args.command.as_deref() {
         Some("check") => cmd_check(args),
+        Some("bundle-css") => cmd_bundle_css(args),
         Some("extract-css") => cmd_extract_css(args),
         Some("minify-html") => cmd_minify_html(args),
         Some("zap") => cmd_zap(args),
@@ -2115,13 +2404,13 @@ pub fn run() -> i32 {
         Some("translate") => cmd_translate(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
             eprintln!("localize: expected subcommand (check, extract-css, minify-html, towebp, translate, or zap)");
-            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }

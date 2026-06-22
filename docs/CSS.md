@@ -137,3 +137,134 @@ minimizing the race window for duplicate writes.
   to create the same CSS files again (harmlessly skipped by `create_new`).
   Already-extracted HTML files will be modified again (link tags will
   accumulate if `<style>` blocks have already been removed on a previous run).
+
+---
+
+# `bundle-css` subcommand
+
+Bundles all `<link rel="stylesheet">` CSS files across the entire site into a
+single monolithic content-addressed `.css` file, then rewrites every HTML file
+to reference the single bundle instead of multiple individual stylesheets.
+
+Designed to follow `extract-css --apply`: first extract inline `<style>` blocks
+into CSS files, then bundle everything (extracted + original external CSS) into
+one file.
+
+## Usage
+
+```
+localize bundle-css [ROOT] [flags]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--apply` | off | Write the bundle and rewrite HTML. Without it, files are scanned and reported but untouched. |
+| `--bundle-dir <dir>` | `bundle` | Output directory for the bundle file (relative to root). |
+| `--include`, `--exclude` | `*.html`, `*.htm` | Glob patterns for file selection. |
+| `--verbose` | off | Per-file output during discovery. |
+| `--jobs <n>` | CPUs × 4 | Max parallel workers. |
+
+**Examples:**
+
+```sh
+# Full pipeline: extract inline CSS, then bundle everything
+localize extract-css ~/mysite --apply
+localize bundle-css ~/mysite --apply
+
+# Dry-run: see what would be bundled
+localize bundle-css ~/mysite
+
+# Custom output directory
+localize bundle-css ~/mysite --apply --bundle-dir static/bundle
+```
+
+## Pipeline
+
+Three phases, all parallelized with `crossbeam`:
+
+### Phase 1: Collection
+
+All HTML files are scanned in parallel for `<link rel="stylesheet">` tags.
+Each link's `href` is resolved against the containing HTML file's directory
+to produce a root-relative filesystem path. All unique CSS file paths are
+collected in a `BTreeSet` (ordered, unique). Per-file link spans are recorded
+for the rewrite phase.
+
+Links are classified as **bundlable** or **non-bundlable** based on their
+`media` attribute:
+
+| `media` value | Bundled? |
+|---|---|
+| (absent) | ✓ bundled |
+| `all` | ✓ bundled |
+| `screen` | ✓ bundled |
+| `print` | ✗ preserved as-is |
+| `only screen and (...)` | ✗ preserved as-is |
+| any other value | ✗ preserved as-is |
+
+Remote (`http://`/`https://`) CSS URLs are not bundled and their `<link>` tags
+are preserved.
+
+### Phase 2: Concatenation
+
+Unique CSS files are concatenated in lexicographic order by root-relative path.
+This is deterministic across runs. The result is written to a fixed path:
+
+```
+{bundle-dir}/bundle.css
+```
+
+Empty CSS files are skipped. Missing files are skipped with a warning.
+
+### Phase 3: HTML rewriting
+
+Each HTML file that has bundlable links is rewritten in parallel:
+1. All bundlable `<link>` tags are removed via descending-span surgery (same
+   pattern as `extract-css`)
+2. A single `<link rel="stylesheet" href="{relative_path}">` tag is inserted
+   before `</head>` (with the same fallback chain: `</head>` → `<body` →
+   `<html>` → position 0)
+3. Non-bundlable `<link>` tags (media-specific, remote) are left untouched
+
+The relative `href` path from each HTML file to the bundle is computed
+dynamically, so files in subdirectories get paths like `../bundle/xx/hash.css`.
+
+## Idempotency
+
+Re-running on an already-bundled site is safe: the bundle overwrites the
+existing `bundle/bundle.css` with identical content, and the HTML rewrite
+replaces the old bundle `<link>` with an identical new one.
+
+## Edge cases
+
+| Case | Behavior |
+|---|---|
+| No CSS files found | Command exits with "No local CSS files to bundle" |
+| Media-specific link (`media="print"`, etc.) | Preserved as a separate `<link>` tag |
+| Remote CSS URL | Skipped, `<link>` tag preserved |
+| Missing CSS file on disk | Skipped with warning |
+| `<link>` in `<body>` | Bundled regardless of position in HTML |
+| Site with only one CSS file | Still processed — single file becomes the bundle |
+| HTML5 without `</head>` | Inserts bundle link before `<body` |
+| Links with `rel="stylesheet preload"` | Bundled (contains "stylesheet" token) |
+| Links with `rel="preload"` only | Skipped (not a stylesheet) |
+
+## Dependencies
+
+- **`std::collections::BTreeSet`** — sorted unique CSS path collection.
+- No new third-party dependencies.
+
+## Limitations
+
+- **No CSS minification** — the bundle is byte-for-byte concatenation of
+  source files. Minification is a separate concern.
+- **No dead-code elimination** — all CSS from all pages is included in the
+  bundle, even rules that don't apply to a given page.
+- **No source maps** — the bundle has no mapping back to original files.
+- **No media query wrapping** — files linked with `media="screen"` are bundled
+  without wrapping, which is safe since `screen` is the default medium.
+  Media-specific links (`print`, `max-width`, etc.) are preserved as-is.
+- **Lexicographic ordering** — CSS files are concatenated in alphabetical
+  order by root-relative path, which may not match the original cascade order.
+  This works correctly when CSS specificity and source order don't interact
+  across files, which is the common case for WordPress themes.
