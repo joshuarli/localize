@@ -5,7 +5,7 @@
 
 use html5gum::emitters::default::DefaultEmitter;
 use html5gum::Tokenizer;
-use macos_translate::{LanguageTranslator, TranslationRequest};
+use macos_translate::{LanguageTranslator, TranslationError, TranslationRequest};
 use std::ops::Range;
 use std::path::Path;
 
@@ -480,36 +480,57 @@ fn translate_article_cluster(
             .collect()
     };
 
-    match translator.translate(&joined) {
-        Ok(response) => {
-            let translated_parts: Vec<&str> =
-                response.target_text.split(ARTICLE_SEPARATOR).collect();
-            if translated_parts.len() == cores.len() {
-                for (i, &idx) in indices.iter().enumerate() {
-                    let (prefix, _, suffix) = &part_strs[i];
-                    let mut result = String::with_capacity(
-                        prefix.len() + translated_parts[i].len() + suffix.len(),
-                    );
-                    result.push_str(prefix);
-                    result.push_str(translated_parts[i]);
-                    result.push_str(suffix);
-                    segments[idx].translated = Some(result);
-                    count += 1;
-                }
-                return count;
-            }
+    let article_translation = match translator.translate(&joined) {
+        Ok(response) => Some(response),
+        Err(TranslationError::TimedOut { seconds, .. }) => {
+            // Timeout on first attempt — retry once. Article translations are
+            // long and the model may need a second warm-up pass.
             if verbose {
                 eprintln!(
-                    "  note: separator split mismatch (expected {}, got {}), falling back to batch",
-                    cores.len(),
-                    translated_parts.len()
+                    "  note: article translation timed out after {seconds}s, retrying..."
                 );
+            }
+            match translator.translate(&joined) {
+                Ok(response) => Some(response),
+                Err(e2) => {
+                    if verbose {
+                        eprintln!("  warning: article translation retry also failed ({e2}), falling back to batch");
+                    }
+                    None
+                }
             }
         }
         Err(e) => {
             if verbose {
                 eprintln!("  warning: article translation failed ({e}), falling back to batch");
             }
+            None
+        }
+    };
+
+    if let Some(response) = article_translation {
+        let translated_parts: Vec<&str> =
+            response.target_text.split(ARTICLE_SEPARATOR).collect();
+        if translated_parts.len() == cores.len() {
+            for (i, &idx) in indices.iter().enumerate() {
+                let (prefix, _, suffix) = &part_strs[i];
+                let mut result = String::with_capacity(
+                    prefix.len() + translated_parts[i].len() + suffix.len(),
+                );
+                result.push_str(prefix);
+                result.push_str(translated_parts[i]);
+                result.push_str(suffix);
+                segments[idx].translated = Some(result);
+                count += 1;
+            }
+            return count;
+        }
+        if verbose {
+            eprintln!(
+                "  note: separator split mismatch (expected {}, got {}), falling back to batch",
+                cores.len(),
+                translated_parts.len()
+            );
         }
     }
 
@@ -574,7 +595,16 @@ fn translate_batch_cluster(
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("  warning: translation failed for segment: {e}");
+                    match &e {
+                        TranslationError::TimedOut { operation, seconds } => {
+                            eprintln!(
+                                "  warning: {operation} timed out after {seconds}s for segment"
+                            );
+                        }
+                        _ => {
+                            eprintln!("  warning: translation failed for segment: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -706,17 +736,61 @@ pub fn process_file(
         }
     };
 
-    let translator = LanguageTranslator::new(&source_lang, to_lang).map_err(|e| {
-        format!(
-            "{}: language pair {source_lang}→{to_lang} not available: {e}",
-            path.display()
-        )
-    })?;
+    let translator = match LanguageTranslator::new(&source_lang, to_lang) {
+        Ok(t) => t,
+        Err(TranslationError::LanguageNotInstalled { source, target }) => {
+            return Err(format!(
+                "{}: translation model not installed for {source} → {target}\n\
+                 Hint: open System Settings → General → Language & Region → \
+                 Translation to download the model",
+                path.display()
+            ));
+        }
+        Err(TranslationError::LanguageUnsupported { source, target }) => {
+            return Err(format!(
+                "{}: language pair {source} → {target} is not supported by \
+                 Apple's on-device Translation framework",
+                path.display()
+            ));
+        }
+        Err(TranslationError::NoConcurrencyRuntime) => {
+            return Err(format!(
+                "{}: Swift Concurrency runtime unavailable — this tool must \
+                 run from a process with a main RunLoop (e.g. Terminal.app, \
+                 not a background daemon)",
+                path.display()
+            ));
+        }
+        Err(TranslationError::TimedOut { operation, seconds }) => {
+            return Err(format!(
+                "{}: {operation} timed out after {seconds}s — the model may \
+                 still be downloading; try again in a moment",
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "{}: language pair {source_lang}→{to_lang} unavailable: {e}",
+                path.display()
+            ));
+        }
+    };
 
     // Pre-warm the translation engine (downloads model if needed).
     if let Err(e) = translator.prepare() {
-        if verbose {
-            eprintln!("  warning: prepare failed (non-fatal): {e}");
+        match &e {
+            TranslationError::TimedOut { .. } => {
+                // Timeout during warm-up is common on first use while the model
+                // loads; the actual translation call will also warm the engine.
+                if verbose {
+                    eprintln!("  note: prepare timed out (model may still be warming up)");
+                }
+            }
+            _ => {
+                if verbose {
+                    eprintln!("  warning: prepare failed (non-fatal): {e}");
+                }
+            }
         }
     }
 
