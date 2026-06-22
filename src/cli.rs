@@ -1,5 +1,6 @@
 use crate::downloader::{DownloadConfig, asset_path, download_and_rewrite};
 use crate::scanner::{MediaReference, is_remote_url, scan_file};
+use crate::webp_encode::ConvertResult;
 use lexopt::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Write;
@@ -973,7 +974,7 @@ fn split_url_descriptor(entry: &str) -> (&str, &str) {
 
 /// Upper bound on decoded image size in bytes for concurrency calculations.
 /// A 5 MB PNG decompresses to ~20 MB of RGBA; 20 MB is a reasonable web-image estimate.
-const PER_IMAGE_MEMORY_ESTIMATE: u64 = 20 * 1024 * 1024;
+const PER_IMAGE_MEMORY_ESTIMATE: u64 = 8 * 1024 * 1024;
 
 /// Returns *available* system memory in bytes (free + inactive pages), or a
 /// fallback.  Available memory is what the OS can hand out without swapping.
@@ -1039,7 +1040,7 @@ fn system_available_memory_bytes() -> u64 {
 /// stays under half of available system memory.
 fn memory_capped_jobs(raw_jobs: usize) -> usize {
     let available = system_available_memory_bytes();
-    let max_jobs = ((available / 2) / PER_IMAGE_MEMORY_ESTIMATE) as usize;
+    let max_jobs = (available / PER_IMAGE_MEMORY_ESTIMATE) as usize;
     raw_jobs.min(max_jobs).max(1)
 }
 
@@ -1055,7 +1056,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
         &args.include
     };
     let raw_jobs = if args.jobs == 0 {
-        num_cpus() * 4
+        num_cpus() * 8
     } else {
         args.jobs
     };
@@ -1096,7 +1097,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
 
     // Phase 1: collect unique images and convert them (only when --apply).
     let converted: FxHashSet<String> = if apply {
-        let mut unique: FxHashSet<String> = FxHashSet::default();
+        let mut unique: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(files.len(), Default::default());
         // Keyed by resolved filesystem path so the same image referenced from
         // multiple HTML files is deduplicated.
 
@@ -1214,7 +1215,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                             let _ = write!(std::io::stderr(), "  converting {resolved} ... ");
                         }
                         let outcome = match crate::webp_encode::convert_to_webp(&abs_path) {
-                            Ok(webp_bytes) => {
+                            Ok(ConvertResult::Converted(webp_bytes)) => {
                                 let webp_path = abs_path.with_extension("webp");
                                 if let Err(e) = std::fs::write(&webp_path, &webp_bytes) {
                                     Err(format!("write webp: {e}"))
@@ -1242,6 +1243,31 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                         } else {
                                             Ok(())
                                         }
+                                    }
+                                }
+                            }
+                            Ok(ConvertResult::AlreadyWebp) => {
+                                // File is already WebP (detected by RIFF....WEBP header).
+                                // If it has a non-.webp extension, fix it.
+                                let already_webp_ext = abs_path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|e| e.eq_ignore_ascii_case("webp"))
+                                    .unwrap_or(false);
+                                if already_webp_ext {
+                                    Ok(())
+                                } else {
+                                    let webp_path = abs_path.with_extension("webp");
+                                    if webp_path.exists() {
+                                        // .webp already exists — the misnamed file is a duplicate.
+                                        std::fs::remove_file(&abs_path)
+                                            .map_err(|e| format!("remove duplicate: {e}"))
+                                    } else if let Err(e) =
+                                        std::fs::rename(&abs_path, &webp_path)
+                                    {
+                                        Err(format!("rename to webp: {e}"))
+                                    } else {
+                                        Ok(())
                                     }
                                 }
                             }
