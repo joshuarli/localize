@@ -264,7 +264,7 @@ fn iter_html_files(root: &str, include: &[String], exclude: &[String]) -> Vec<St
         .filter_map(|p| glob::Pattern::new(p).ok())
         .collect();
 
-    for entry in walkdir::WalkDir::new(root) {
+    for entry in jwalk::WalkDir::new(root).skip_hidden(false).into_iter() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -273,7 +273,7 @@ fn iter_html_files(root: &str, include: &[String], exclude: &[String]) -> Vec<St
             continue;
         }
         let full = entry.path();
-        let rel = full.strip_prefix(root).unwrap_or(full);
+        let rel = full.strip_prefix(root).unwrap_or(&full);
         let rel_str = rel.to_string_lossy();
 
         if exclude_pats.iter().any(|p| p.matches(&rel_str)) {
