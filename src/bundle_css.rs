@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 
@@ -182,9 +181,7 @@ pub fn resolve_css_path(html_rel: &str, href: &str) -> String {
 
 /// Compute the relative path from an HTML file's directory to a target.
 pub fn compute_relative_path(html_file: &str, target: &str) -> String {
-    let html_dir = Path::new(html_file)
-        .parent()
-        .unwrap_or(Path::new(""));
+    let html_dir = Path::new(html_file).parent().unwrap_or(Path::new(""));
     let html_parts: Vec<&str> = html_dir
         .components()
         .map(|c| c.as_os_str().to_str().unwrap_or(""))
@@ -224,11 +221,37 @@ pub struct BundleResult {
     pub bundle_rel: String,
 }
 
-/// Concatenate unique CSS files in lexicographic order and return the
+/// Strip CSS comments (`/* ... */`), including sourceMappingURL and
+/// sourceURL annotations. Preserves everything outside comments byte-for-byte.
+fn strip_css_comments(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip comment: find */
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Concatenate CSS files in the given order, strip comments, and return the
 /// concatenated content and fixed bundle path relative to the site root.
+/// The caller is responsible for determining the correct cascade order.
 pub fn bundle_css_files(
     root: &Path,
-    css_files: &BTreeSet<String>,
+    css_files: &[String],
     bundle_dir: &str,
 ) -> Result<BundleResult, String> {
     let mut concatenated = String::new();
@@ -237,13 +260,15 @@ pub fn bundle_css_files(
         let css_path = root.join(css_rel);
         match std::fs::read_to_string(&css_path) {
             Ok(content) => {
-                if content.is_empty() {
+                let stripped = strip_css_comments(&content);
+                let stripped = stripped.trim();
+                if stripped.is_empty() {
                     continue;
                 }
                 if !concatenated.is_empty() {
                     concatenated.push('\n');
                 }
-                concatenated.push_str(&content);
+                concatenated.push_str(stripped);
             }
             Err(e) => {
                 eprintln!("bundle-css: skipping {css_rel}: {e}");
@@ -266,6 +291,9 @@ pub fn bundle_css_files(
 /// Rewrite HTML: remove the `<link>` tags at the given spans (in reverse
 /// order so earlier spans stay valid), then insert the bundle `<link>` tag
 /// before `</head>` (with fallbacks for minified/malformed HTML).
+///
+/// Each span is extended forward to consume trailing whitespace (spaces,
+/// tabs, newlines) so removal doesn't leave blank lines behind.
 pub fn rewrite_html_for_bundle(
     html: &str,
     spans_to_remove: &[Range<usize>],
@@ -276,7 +304,16 @@ pub fn rewrite_html_for_bundle(
     let mut spans: Vec<Range<usize>> = spans_to_remove.to_vec();
     spans.sort_by_key(|s| std::cmp::Reverse(s.start));
     for span in &spans {
-        modified.replace_range(span.clone(), "");
+        let mut end = span.end;
+        // Consume trailing whitespace so we don't leave blank lines.
+        for &b in modified.as_bytes()[end..].iter() {
+            if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        modified.replace_range(span.start..end, "");
     }
 
     let bundle_link = format!("<link rel=\"stylesheet\" href=\"{bundle_href}\">");
@@ -300,7 +337,10 @@ pub fn rewrite_html_for_bundle(
     } else if let Some(pos) = modified.find("<body") {
         modified.insert_str(pos, &format!("{bundle_link}\n"));
     } else if let Some(pos) = modified.find("<html") {
-        let close = modified[pos..].find('>').map(|e| pos + e + 1).unwrap_or(pos);
+        let close = modified[pos..]
+            .find('>')
+            .map(|e| pos + e + 1)
+            .unwrap_or(pos);
         modified.insert_str(close, &format!("\n{bundle_link}\n"));
     } else {
         modified.insert_str(0, &format!("{bundle_link}\n"));
@@ -388,7 +428,8 @@ mod tests {
 
     #[test]
     fn test_no_stylesheet_links() {
-        let html = "<link rel=\"icon\" href=\"favicon.ico\"><link rel=\"preload\" href=\"font.woff2\">";
+        let html =
+            "<link rel=\"icon\" href=\"favicon.ico\"><link rel=\"preload\" href=\"font.woff2\">";
         let links = find_stylesheet_links(html);
         assert!(links.is_empty());
     }
@@ -475,10 +516,7 @@ mod tests {
 
     #[test]
     fn test_compute_relative_subdir() {
-        let rel = compute_relative_path(
-            "posts/about.html",
-            "bundle/bundle.css",
-        );
+        let rel = compute_relative_path("posts/about.html", "bundle/bundle.css");
         assert_eq!(rel, "../bundle/bundle.css");
     }
 
@@ -520,6 +558,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_html_cleans_trailing_whitespace() {
+        // Three <link> tags on separate lines — removal should not leave
+        // blank lines behind.
+        let html = concat!(
+            "<html>\n<head>\n",
+            "    <link rel=\"stylesheet\" href=\"a.css\">\n",
+            "    <link rel=\"stylesheet\" href=\"b.css\">\n",
+            "    <link rel=\"stylesheet\" href=\"c.css\">\n",
+            "</head>\n<body></body>\n</html>\n",
+        );
+        let links = find_stylesheet_links(html);
+        let spans: Vec<Range<usize>> = links.iter().map(|l| l.span.clone()).collect();
+        let result = rewrite_html_for_bundle(html, &spans, "bundle/bundle.css");
+
+        // Should not contain leftover blank lines where links were removed.
+        assert!(
+            !result.contains("\n\n\n"),
+            "no triple blank lines:\n{result}"
+        );
+        assert!(!result.contains("\n\n"), "no double blank lines:\n{result}");
+        assert!(result.contains("href=\"bundle/bundle.css\""));
+        assert!(!result.contains("a.css"));
+        assert!(!result.contains("b.css"));
+        assert!(!result.contains("c.css"));
+    }
+
+    #[test]
     fn test_bundle_css_files_concatenates_in_order() {
         let dir = std::env::temp_dir().join("bundle-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -528,11 +593,9 @@ mod tests {
         std::fs::write(&a, ".a{color:red}").unwrap();
         std::fs::write(&b, ".b{color:blue}").unwrap();
 
-        let mut set = BTreeSet::new();
-        set.insert("a.css".to_string());
-        set.insert("b.css".to_string());
+        let files: Vec<String> = vec!["a.css".into(), "b.css".into()];
 
-        let result = bundle_css_files(&dir, &set, "bundle").unwrap();
+        let result = bundle_css_files(&dir, &files, "bundle").unwrap();
         assert_eq!(result.concatenated, ".a{color:red}\n.b{color:blue}");
         assert_eq!(result.bundle_rel, "bundle/bundle.css");
 
@@ -540,16 +603,80 @@ mod tests {
     }
 
     #[test]
-    fn test_bundle_css_files_fixed_path() {
+    fn test_bundle_css_files_respects_provided_order() {
         let dir = std::env::temp_dir().join("bundle-test-2");
         let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("a.css"), ".x{}").unwrap();
+        std::fs::write(dir.join("a.css"), ".a{}").unwrap();
+        std::fs::write(dir.join("b.css"), ".b{}").unwrap();
 
-        let mut set = BTreeSet::new();
-        set.insert("a.css".to_string());
-
-        let result = bundle_css_files(&dir, &set, "bundle").unwrap();
+        // Pass in reverse order — concatenation should respect it.
+        let files: Vec<String> = vec!["b.css".into(), "a.css".into()];
+        let result = bundle_css_files(&dir, &files, "bundle").unwrap();
+        assert_eq!(result.concatenated, ".b{}\n.a{}");
         assert_eq!(result.bundle_rel, "bundle/bundle.css");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_strip_css_comments_source_url() {
+        let css = "body{color:red}/*# sourceURL=theme.css */";
+        let result = strip_css_comments(css);
+        assert_eq!(result, "body{color:red}");
+    }
+
+    #[test]
+    fn test_strip_css_comments_source_mapping_url() {
+        let css = "/*# sourceMappingURL=style.css.map */\n.foo{display:none}";
+        let result = strip_css_comments(css);
+        assert_eq!(result, "\n.foo{display:none}");
+    }
+
+    #[test]
+    fn test_strip_css_comments_multiline() {
+        let css = "/* multi\nline\ncomment */\nbody{color:red}";
+        let result = strip_css_comments(css);
+        assert_eq!(result, "\nbody{color:red}");
+    }
+
+    #[test]
+    fn test_strip_css_comments_preserves_non_comment_slashes() {
+        let css = "url(data:image/svg+xml;base64,PHN2Zy8+DQo=)";
+        let result = strip_css_comments(css);
+        assert_eq!(result, css);
+    }
+
+    #[test]
+    fn test_bundle_css_files_strips_comments() {
+        let dir = std::env::temp_dir().join("bundle-comment-test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.css"), "/* header */\n.a{color:red}/* inline */").unwrap();
+        std::fs::write(dir.join("b.css"), ".b{color:blue}/*# sourceURL=b.css */").unwrap();
+
+        let files: Vec<String> = vec!["a.css".into(), "b.css".into()];
+        let result = bundle_css_files(&dir, &files, "bundle").unwrap();
+        assert_eq!(result.concatenated, ".a{color:red}\n.b{color:blue}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cascade_order_preserved() {
+        // Two CSS files with equal-specificity rules on the same element.
+        // The file that appears *last* in the concatenation wins.
+        let dir = std::env::temp_dir().join("bundle-cascade-test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("base.css"), "body{color:red}").unwrap();
+        std::fs::write(dir.join("override.css"), "body{color:blue}").unwrap();
+
+        // index.html references base.css first, then override.css.
+        // override.css should appear after base.css in the bundle.
+        let files: Vec<String> = vec!["base.css".into(), "override.css".into()];
+        let result = bundle_css_files(&dir, &files, "bundle").unwrap();
+        assert_eq!(
+            result.concatenated, "body{color:red}\nbody{color:blue}",
+            "override.css must come after base.css so its rule wins"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

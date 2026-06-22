@@ -157,18 +157,30 @@ fn e2e_extract_css_removes_style_tags() {
 
     let html = site.read("index.html");
     // <style> tags should be gone
-    assert!(!html.contains("<style>"), "style tags should be removed, got:\n{html}");
+    assert!(
+        !html.contains("<style>"),
+        "style tags should be removed, got:\n{html}"
+    );
     assert!(!html.contains("<style "), "style tags should be removed");
     // <link> tags should be present (for extracted CSS)
-    assert!(html.contains("<link rel=\"stylesheet\""), "missing link tags:\n{html}");
+    assert!(
+        html.contains("<link rel=\"stylesheet\""),
+        "missing link tags:\n{html}"
+    );
     // Content-addressed CSS files should exist
     assert!(
         site.exists("localized-css"),
         "localized-css dir should exist"
     );
     // Original <link> tags should still be present (not touched by extract-css)
-    assert!(html.contains("_grab/theme.css"), "original link refs preserved:\n{html}");
-    assert!(html.contains("_grab/components.css"), "original link refs preserved:\n{html}");
+    assert!(
+        html.contains("_grab/theme.css"),
+        "original link refs preserved:\n{html}"
+    );
+    assert!(
+        html.contains("_grab/components.css"),
+        "original link refs preserved:\n{html}"
+    );
 }
 
 #[test]
@@ -180,16 +192,15 @@ fn e2e_extract_css_empty_style_removed() {
         "</head>",
         "<style class=\"wp-fonts-local\"></style>\n</head>",
     );
-    fs::write(
-        Path::new(&site.root).join("about/index.html"),
-        modified,
-    )
-    .unwrap();
+    fs::write(Path::new(&site.root).join("about/index.html"), modified).unwrap();
 
     site.run_extract_css();
 
     let html = site.read("about/index.html");
-    assert!(!html.contains("wp-fonts-local"), "empty style removed:\n{html}");
+    assert!(
+        !html.contains("wp-fonts-local"),
+        "empty style removed:\n{html}"
+    );
 }
 
 #[test]
@@ -198,15 +209,8 @@ fn e2e_extract_css_content_addressed() {
     let site = MockSite::new();
     // Add identical style to about page
     let about_html = site.read("about/index.html");
-    let modified = about_html.replace(
-        "</head>",
-        "<style>.hero{color:red}</style>\n</head>",
-    );
-    fs::write(
-        Path::new(&site.root).join("about/index.html"),
-        modified,
-    )
-    .unwrap();
+    let modified = about_html.replace("</head>", "<style>.hero{color:red}</style>\n</head>");
+    fs::write(Path::new(&site.root).join("about/index.html"), modified).unwrap();
 
     site.run_extract_css();
 
@@ -215,13 +219,22 @@ fn e2e_extract_css_content_addressed() {
 
     // Both files should reference the same CSS file for .hero{color:red}
     let extract_href = |_html: &str, css_content: &str| -> String {
-        let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(css_content.as_bytes()));
+        let hash = format!(
+            "{:016x}",
+            xxhash_rust::xxh3::xxh3_64(css_content.as_bytes())
+        );
         let prefix = &hash[..2];
         format!("localized-css/{prefix}/{hash}.css")
     };
     let hero_href = extract_href(&index_html, ".hero{color:red}");
-    assert!(index_html.contains(&hero_href), "index missing hero ref:\n{index_html}");
-    assert!(about_html.contains(&hero_href), "about missing hero ref:\n{about_html}");
+    assert!(
+        index_html.contains(&hero_href),
+        "index missing hero ref:\n{index_html}"
+    );
+    assert!(
+        about_html.contains(&hero_href),
+        "about missing hero ref:\n{about_html}"
+    );
 }
 
 #[test]
@@ -267,20 +280,33 @@ fn e2e_bundle_css_creates_single_bundle() {
     );
 
     // Bundle file should exist at the fixed path.
-    assert!(site.exists("bundle/bundle.css"), "bundle CSS file should exist at bundle/bundle.css");
+    assert!(
+        site.exists("bundle/bundle.css"),
+        "bundle CSS file should exist at bundle/bundle.css"
+    );
 
-    let bundle_content = fs::read_to_string(
-        Path::new(&site.root).join("bundle/bundle.css"),
-    )
-    .unwrap();
-    assert!(bundle_content.contains(".hero{color:red}"), "missing hero style");
-    assert!(bundle_content.contains(".footer{padding:10px}"), "missing footer style");
-    assert!(bundle_content.contains(".about-bio{font-style:italic}"), "missing about style");
+    let bundle_content =
+        fs::read_to_string(Path::new(&site.root).join("bundle/bundle.css")).unwrap();
+    assert!(
+        bundle_content.contains(".hero{color:red}"),
+        "missing hero style"
+    );
+    assert!(
+        bundle_content.contains(".footer{padding:10px}"),
+        "missing footer style"
+    );
+    assert!(
+        bundle_content.contains(".about-bio{font-style:italic}"),
+        "missing about style"
+    );
     assert!(
         bundle_content.contains("body{font-family:sans-serif}"),
         "missing theme style"
     );
-    assert!(bundle_content.contains(".btn{padding:8px}"), "missing components style");
+    assert!(
+        bundle_content.contains(".btn{padding:8px}"),
+        "missing components style"
+    );
 
     // Verify stderr reports correct counts
     assert!(stderr.contains("bundle"), "stderr should mention bundle");
@@ -307,16 +333,26 @@ fn e2e_bundle_css_preserves_media_specific_links() {
 
     let html = site.read("index.html");
     // The media-specific link should still be there
-    assert!(html.contains("max-width: 768px"), "media link preserved:\n{html}");
+    assert!(
+        html.contains("max-width: 768px"),
+        "media link preserved:\n{html}"
+    );
     assert!(html.contains("mobile.css"), "mobile.css preserved:\n{html}");
     // But there should also be a bundle link
-    assert!(html.contains("bundle/"), "bundle link should exist:\n{html}");
+    assert!(
+        html.contains("bundle/"),
+        "bundle link should exist:\n{html}"
+    );
     // Count stylesheet links: 1 bundle + 1 media
     let links: Vec<&str> = html
         .lines()
         .filter(|l| l.contains("rel=\"stylesheet\"") || l.contains("rel=stylesheet"))
         .collect();
-    assert_eq!(links.len(), 2, "should have 2 links (bundle + media):\n{html}");
+    assert_eq!(
+        links.len(),
+        2,
+        "should have 2 links (bundle + media):\n{html}"
+    );
 }
 
 #[test]
@@ -325,7 +361,10 @@ fn e2e_bundle_css_dry_run_reports_without_writing() {
     site.run_extract_css();
 
     let stderr = site.run_bundle_css_dry();
-    assert!(stderr.contains("Dry-run"), "should indicate dry-run:\n{stderr}");
+    assert!(
+        stderr.contains("Dry-run"),
+        "should indicate dry-run:\n{stderr}"
+    );
 
     // HTML files should NOT be modified
     let index_html = site.read("index.html");
@@ -334,7 +373,10 @@ fn e2e_bundle_css_dry_run_reports_without_writing() {
         "original links preserved in dry-run:\n{index_html}"
     );
     // Bundle dir should NOT exist
-    assert!(!site.exists("bundle"), "bundle dir should not exist after dry-run");
+    assert!(
+        !site.exists("bundle"),
+        "bundle dir should not exist after dry-run"
+    );
 }
 
 #[test]
@@ -347,8 +389,14 @@ fn e2e_full_pipeline_extract_then_bundle() {
     // Phase 1: extract
     site.run_extract_css();
     let index_html = site.read("index.html");
-    assert!(!index_html.contains("<style>"), "no style tags after extract");
-    assert!(!index_html.contains("<style "), "no style tags after extract");
+    assert!(
+        !index_html.contains("<style>"),
+        "no style tags after extract"
+    );
+    assert!(
+        !index_html.contains("<style "),
+        "no style tags after extract"
+    );
 
     // Phase 2: bundle
     site.run_bundle_css();
@@ -393,4 +441,46 @@ fn e2e_bundle_css_fixed_path() {
     );
 
     assert!(site.exists("bundle/bundle.css"), "bundle file should exist");
+}
+
+#[test]
+fn e2e_bundle_css_preserves_cascade_order() {
+    // Verify that the bundle concatenates CSS files in index.html's
+    // document order, so later rules correctly override earlier ones
+    // when specificity is equal.
+    let site = MockSite::new();
+    // Write CSS files with equal-specificity rules on the same element.
+    // base.css sets color:red, override.css sets color:blue.
+    // If cascade order is wrong (override first, then base), red wins.
+    fs::write(
+        Path::new(&site.root).join("_grab/base.css"),
+        "body{color:red}",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&site.root).join("_grab/override.css"),
+        "body{color:blue}",
+    )
+    .unwrap();
+
+    // Update index.html link order: base.css first, override.css second.
+    let index_html = site.read("index.html");
+    let modified = index_html.replace(
+        "<link rel=\"stylesheet\" href=\"_grab/components.css\">\n",
+        "<link rel=\"stylesheet\" href=\"_grab/components.css\">\n<link rel=\"stylesheet\" href=\"_grab/base.css\">\n<link rel=\"stylesheet\" href=\"_grab/override.css\">\n",
+    );
+    fs::write(Path::new(&site.root).join("index.html"), modified).unwrap();
+
+    site.run_extract_css();
+    site.run_bundle_css();
+
+    let bundle = site.read("bundle/bundle.css");
+    let base_pos = bundle.find("body{color:red}").unwrap();
+    let override_pos = bundle.find("body{color:blue}").unwrap();
+    assert!(
+        override_pos > base_pos,
+        "override.css must come after base.css in the bundle so its rule wins.\n\
+         base.css at byte {base_pos}, override.css at byte {override_pos}\n\
+         Bundle:\n{bundle}"
+    );
 }

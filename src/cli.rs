@@ -175,7 +175,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (check, minify-html, zap, towebp, or translate)".into());
+                return Err(
+                    "expected subcommand (check, minify-html, zap, towebp, or translate)".into(),
+                );
             }
         }
     }
@@ -434,11 +436,10 @@ fn scan_all(
                         eprint!("\rScanning: {done}/{total} files");
                         let _ = std::io::stderr().flush();
                     }
-                    if let Some(err) = &result.error {
-                        if let Ok(mut errs) = errors.lock() {
+                    if let Some(err) = &result.error
+                        && let Ok(mut errs) = errors.lock() {
                             errs.push(format!("{rel}: {err}"));
                         }
-                    }
                     if verbose && !result.references.is_empty() {
                         eprintln!("  {rel}: {} reference(s)", result.references.len());
                     }
@@ -764,7 +765,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
                             let rel = &clean_files[i];
                             let path = Path::new(root).join(rel);
                             let content = std::fs::read_to_string(&path).unwrap_or_default();
-                            match crate::rewriter::clean_html(&content, &href_set, rel) {
+                            match crate::rewriter::clean_html(&content, href_set, rel) {
                                 Ok(new_html) => {
                                     let tmp = path.with_extension("tmp");
                                     if let Err(e) = std::fs::write(&tmp, &new_html)
@@ -887,10 +888,7 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
     }
 
     if apply {
-        eprintln!(
-            "Minifying {} file(s) with {jobs} workers...",
-            files.len()
-        );
+        eprintln!("Minifying {} file(s) with {jobs} workers...", files.len());
     } else {
         eprintln!(
             "Dry-run: scanning {} file(s) with {jobs} workers...",
@@ -1019,8 +1017,9 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
     let file_count = files.len();
     let workers = jobs.min(files.len());
 
-    let unique_css: std::sync::Mutex<BTreeSet<String>> =
-        std::sync::Mutex::new(BTreeSet::new());
+    let unique_css: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    // Ordered resolved paths from index.html (canonical cascade order).
+    let index_order: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let per_file: std::sync::Mutex<Vec<(String, Vec<crate::bundle_css::CssLink>)>> =
         std::sync::Mutex::new(Vec::new());
     let done_counter = AtomicUsize::new(0);
@@ -1028,6 +1027,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
     let _ = crossbeam::thread::scope(|s| {
         let files: &[String] = &files;
         let unique_css: &std::sync::Mutex<BTreeSet<String>> = &unique_css;
+        let index_order: &std::sync::Mutex<Vec<String>> = &index_order;
         let per_file: &std::sync::Mutex<Vec<(String, Vec<crate::bundle_css::CssLink>)>> = &per_file;
         let done_counter: &AtomicUsize = &done_counter;
         let index = Arc::new(AtomicUsize::new(0));
@@ -1045,7 +1045,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
 
                     let links = crate::bundle_css::find_stylesheet_links(&content);
 
-                    // Collect unique resolved CSS paths for bundlable links.
+                    // Collect resolved CSS paths in document order.
                     let mut resolved_paths: Vec<String> = Vec::new();
                     for link in &links {
                         if link.bundlable {
@@ -1054,19 +1054,24 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
                         }
                     }
 
-                    if !resolved_paths.is_empty() {
-                        if let Ok(mut css_set) = unique_css.lock() {
-                            for p in resolved_paths {
-                                css_set.insert(p);
+                    if !resolved_paths.is_empty()
+                        && let Ok(mut css_set) = unique_css.lock() {
+                            for p in &resolved_paths {
+                                css_set.insert(p.clone());
                             }
                         }
-                    }
 
-                    if !links.is_empty() {
-                        if let Ok(mut pf) = per_file.lock() {
+                    // Capture index.html's cascade order once.
+                    if rel == "index.html"
+                        && let Ok(mut order) = index_order.lock()
+                            && order.is_empty() {
+                                *order = resolved_paths;
+                            }
+
+                    if !links.is_empty()
+                        && let Ok(mut pf) = per_file.lock() {
                             pf.push((rel.clone(), links));
                         }
-                    }
 
                     let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if !verbose && done.is_multiple_of(16) {
@@ -1083,21 +1088,41 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
     }
 
     let unique_css = unique_css.into_inner().unwrap();
+    let index_order = index_order.into_inner().unwrap();
     let per_file = per_file.into_inner().unwrap();
+
+    // Build canonical concatenation order: index.html's cascade order first,
+    // then remaining files (not in index.html) sorted alphabetically.
+    let mut ordered_files: Vec<String> = Vec::with_capacity(unique_css.len());
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    for p in &index_order {
+        if unique_css.contains(p) && seen.insert(p.clone()) {
+            ordered_files.push(p.clone());
+        }
+    }
+    // Append any CSS files not referenced by index.html, sorted.
+    let mut remaining: Vec<&String> = unique_css.iter().filter(|p| !seen.contains(*p)).collect();
+    remaining.sort();
+    for p in remaining {
+        ordered_files.push(p.clone());
+    }
 
     eprintln!(
         "Found {} unique CSS file(s) to bundle across {} HTML file(s).",
         unique_css.len(),
-        per_file.iter().filter(|(_, links)| links.iter().any(|l| l.bundlable)).count(),
+        per_file
+            .iter()
+            .filter(|(_, links)| links.iter().any(|l| l.bundlable))
+            .count(),
     );
 
-    if unique_css.is_empty() {
+    if ordered_files.is_empty() {
         eprintln!("No local CSS files to bundle.");
         return Ok(());
     }
 
-    // Phase 2: concatenate, hash, and write the bundle.
-    let bundle_result = crate::bundle_css::bundle_css_files(root_path, &unique_css, bundle_dir)
+    // Phase 2: concatenate in canonical order and write the bundle.
+    let bundle_result = crate::bundle_css::bundle_css_files(root_path, &ordered_files, bundle_dir)
         .map_err(|e| format!("failed to create bundle: {e}"))?;
 
     let bundle_rel = &bundle_result.bundle_rel;
@@ -1115,6 +1140,26 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
             bundle_size as f64 / 1024.0,
             bundle_rel,
         );
+
+        // Phase 2b: trash source CSS files that were bundled.
+        let trash_root = root_path.join(".trash");
+        let mut trashed = 0usize;
+        for css_rel in &ordered_files {
+            let src = root_path.join(css_rel);
+            if !src.is_file() {
+                continue;
+            }
+            let trash_path = trash_root.join(css_rel);
+            if let Some(parent) = trash_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&src, &trash_path).is_ok() {
+                trashed += 1;
+            }
+        }
+        if trashed > 0 {
+            eprintln!("Trashed {} source CSS file(s) to .trash/.", trashed,);
+        }
     } else {
         eprintln!(
             "Dry-run: would write bundle ({:.1} KB) to ./{}",
@@ -1169,10 +1214,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
                         }
 
                         let content = std::fs::read_to_string(&path).unwrap_or_default();
-                        let bundle_href = crate::bundle_css::compute_relative_path(
-                            rel,
-                            bundle_rel,
-                        );
+                        let bundle_href = crate::bundle_css::compute_relative_path(rel, bundle_rel);
                         let modified = crate::bundle_css::rewrite_html_for_bundle(
                             &content,
                             &bundlable_spans,
@@ -1183,8 +1225,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
                         if let Err(e) = std::fs::write(&tmp, &modified)
                             .map_err(|e| format!("write tmp: {e}"))
                             .and_then(|_| {
-                                std::fs::rename(&tmp, &path)
-                                    .map_err(|e| format!("rename: {e}"))
+                                std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
                             })
                         {
                             if let Ok(mut errs) = rewrite_errors.lock() {
@@ -1217,11 +1258,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
         }
 
         let rewrote = rewrite_count.load(Ordering::Relaxed);
-        eprintln!(
-            "Rewrote {} file(s), bundle at ./{}",
-            rewrote,
-            bundle_rel,
-        );
+        eprintln!("Rewrote {} file(s), bundle at ./{}", rewrote, bundle_rel,);
     } else {
         // Dry-run: show what would change per file.
         for (rel, links) in &per_file {
@@ -1229,10 +1266,7 @@ fn cmd_bundle_css(args: Args) -> Result<(), String> {
             if bundlable.is_empty() {
                 continue;
             }
-            let bundle_href = crate::bundle_css::compute_relative_path(
-                rel,
-                bundle_rel,
-            );
+            let bundle_href = crate::bundle_css::compute_relative_path(rel, bundle_rel);
             println!("./{rel}");
             for link in &bundlable {
                 let resolved = crate::bundle_css::resolve_css_path(rel, &link.href);
@@ -1348,12 +1382,22 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
 
                     if apply {
                         // Delete <style> blocks (reverse span order, like zap).
+                        // Extend each span past trailing whitespace so removal
+                        // doesn't leave blank lines behind.
                         let mut modified = content;
                         let mut spans: Vec<std::ops::Range<usize>> =
-                            result.spans_to_delete.iter().cloned().collect();
+                            result.spans_to_delete.to_vec();
                         spans.sort_by_key(|s| std::cmp::Reverse(s.start));
                         for span in &spans {
-                            modified.replace_range(span.clone(), "");
+                            let mut end = span.end;
+                            for &b in modified.as_bytes()[end..].iter() {
+                                if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+                                    end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            modified.replace_range(span.start..end, "");
                         }
 
                         // Insert <link> tags before </head>.
@@ -1379,7 +1423,10 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
                         } else if let Some(pos) = modified.find("<body") {
                             modified.insert_str(pos, &format!("{links}\n"));
                         } else if let Some(pos) = modified.find("<html") {
-                            let close = modified[pos..].find('>').map(|e| pos + e + 1).unwrap_or(pos);
+                            let close = modified[pos..]
+                                .find('>')
+                                .map(|e| pos + e + 1)
+                                .unwrap_or(pos);
                             modified.insert_str(close, &format!("\n{links}\n"));
                         } else {
                             modified.insert_str(0, &format!("{links}\n"));
@@ -1410,22 +1457,21 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
                         if let Err(e) = std::fs::write(&tmp, &modified)
                             .map_err(|e| format!("write tmp: {e}"))
                             .and_then(|_| {
-                                std::fs::rename(&tmp, &path)
-                                    .map_err(|e| format!("rename: {e}"))
+                                std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
                             })
-                        {
-                            if let Ok(mut errs) = errors_mu.lock() {
+                            && let Ok(mut errs) = errors_mu.lock() {
                                 errs.push((rel.clone(), format!("{}: {e}", path.display())));
                             }
-                        }
                     }
 
                     total_styles.fetch_add(result.writes.len(), Ordering::Relaxed);
                     total_files.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut results) = file_results.lock() {
-                        let paths: Vec<String> = result.writes.iter().map(|(hash, _)| {
-                            format!("{dir}/{}/{hash}.css", &hash[..2])
-                        }).collect();
+                        let paths: Vec<String> = result
+                            .writes
+                            .iter()
+                            .map(|(hash, _)| format!("{dir}/{}/{hash}.css", &hash[..2]))
+                            .collect();
                         results.push((rel.clone(), paths));
                     }
 
@@ -1484,11 +1530,7 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
 /// Depth-first HTML file collector. Groups sibling files together so workers
 /// processing adjacent entries encounter the same CSS blocks close in time,
 /// reducing the window for duplicate writes.
-fn collect_html_depth_first(
-    root: &str,
-    include: &[String],
-    exclude: &[String],
-) -> Vec<String> {
+fn collect_html_depth_first(root: &str, include: &[String], exclude: &[String]) -> Vec<String> {
     let include_pats: Vec<glob::Pattern> = include
         .iter()
         .filter_map(|p| glob::Pattern::new(p).ok())
@@ -1519,7 +1561,7 @@ fn walk_depth_first(
         Ok(iter) => iter.filter_map(|e| e.ok()).collect(),
         Err(_) => return,
     };
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in &entries {
         let path = entry.path();
@@ -1606,7 +1648,8 @@ fn cmd_zap(args: Args) -> Result<(), String> {
         let files: &[String] = &files;
         let selector: &crate::zap::SimpleSelector = &selector;
         let errors: &std::sync::Mutex<Vec<(String, String)>> = &errors;
-        let file_results: &std::sync::Mutex<Vec<(String, Vec<crate::zap::ZapMatch>)>> = &file_results;
+        let file_results: &std::sync::Mutex<Vec<(String, Vec<crate::zap::ZapMatch>)>> =
+            &file_results;
         let total_matches: &AtomicUsize = &total_matches;
         let done_counter: &AtomicUsize = &done_counter;
         let index = Arc::new(AtomicUsize::new(0));
@@ -1622,7 +1665,7 @@ fn cmd_zap(args: Args) -> Result<(), String> {
                     let path = root_path.join(rel);
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     let (result, modified) = if apply {
-                        match crate::rewriter::zap_html(&content, &selector, &query) {
+                        match crate::rewriter::zap_html(&content, selector, query) {
                             Ok((html, matches)) => (
                                 crate::zap::ZapResult {
                                     matches,
@@ -1643,7 +1686,7 @@ fn cmd_zap(args: Args) -> Result<(), String> {
                             }
                         }
                     } else {
-                        let result = crate::zap::scan_html(&content, &selector, &query);
+                        let result = crate::zap::scan_html(&content, selector, query);
                         (result, None)
                     };
                     if let Some(new_html) = modified
@@ -2143,7 +2186,10 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                                     })
                                 {
                                     if let Ok(mut errs) = errors.lock() {
-                                        errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                                        errs.push((
+                                            rel.clone(),
+                                            format!("{}: {e}", path.display()),
+                                        ));
                                     }
                                     let done = phase2_done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if !verbose && done.is_multiple_of(16) {
@@ -2388,7 +2434,9 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!(
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+            );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
@@ -2404,13 +2452,19 @@ pub fn run() -> i32 {
         Some("translate") => cmd_translate(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!(
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+            );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (check, extract-css, minify-html, towebp, translate, or zap)");
-            eprintln!("Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
+            eprintln!(
+                "localize: expected subcommand (check, extract-css, minify-html, towebp, translate, or zap)"
+            );
+            eprintln!(
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+            );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }

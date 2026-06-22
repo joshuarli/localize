@@ -1,5 +1,5 @@
-use html5gum::emitters::default::DefaultEmitter;
 use html5gum::Tokenizer;
+use html5gum::emitters::default::DefaultEmitter;
 use std::ops::Range;
 
 #[derive(Debug, Clone)]
@@ -96,11 +96,7 @@ fn compute_relative_path(html_file: &str, target: &str) -> String {
     }
 }
 
-pub fn extract_css(
-    html: &str,
-    file_rel: &str,
-    css_dir: &str,
-) -> Result<ExtractResult, String> {
+pub fn extract_css(html: &str, file_rel: &str, css_dir: &str) -> Result<ExtractResult, String> {
     let blocks = find_style_blocks(html)?;
 
     let mut writes = Vec::new();
@@ -113,14 +109,15 @@ pub fn extract_css(
             continue;
         }
 
-        let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(block.content.as_bytes()));
+        let hash = format!(
+            "{:016x}",
+            xxhash_rust::xxh3::xxh3_64(block.content.as_bytes())
+        );
         let prefix = &hash[..2];
         let css_path = format!("{css_dir}/{prefix}/{hash}.css");
         let href = compute_relative_path(file_rel, &css_path);
 
-        link_tags.push(format!(
-            "<link rel=\"stylesheet\" href=\"{href}\">"
-        ));
+        link_tags.push(format!("<link rel=\"stylesheet\" href=\"{href}\">"));
 
         writes.push((hash, block.content.clone()));
         spans_to_delete.push(block.span.clone());
@@ -143,7 +140,10 @@ mod tests {
         let blocks = find_style_blocks(html).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].content, "body { color: red; }");
-        assert_eq!(&html[blocks[0].span.clone()], "<style>body { color: red; }</style>");
+        assert_eq!(
+            &html[blocks[0].span.clone()],
+            "<style>body { color: red; }</style>"
+        );
     }
 
     #[test]
@@ -157,10 +157,7 @@ mod tests {
 
     #[test]
     fn test_multiple_styles() {
-        let html = concat!(
-            "<style>.a{}</style>",
-            "<style>.b{}</style>",
-        );
+        let html = concat!("<style>.a{}</style>", "<style>.b{}</style>",);
         let result = extract_css(html, "index.html", "localized-css").unwrap();
         assert_eq!(result.writes.len(), 2);
         assert_eq!(result.link_tags.len(), 2);
@@ -223,7 +220,8 @@ mod tests {
 
     #[test]
     fn test_compute_relative_subdir() {
-        let result = compute_relative_path("posts/about.html", "localized-css/a1/a1b2c3d4e5f67890.css");
+        let result =
+            compute_relative_path("posts/about.html", "localized-css/a1/a1b2c3d4e5f67890.css");
         assert_eq!(result, "../localized-css/a1/a1b2c3d4e5f67890.css");
     }
 

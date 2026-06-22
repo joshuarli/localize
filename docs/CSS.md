@@ -205,10 +205,29 @@ Links are classified as **bundlable** or **non-bundlable** based on their
 Remote (`http://`/`https://`) CSS URLs are not bundled and their `<link>` tags
 are preserved.
 
-### Phase 2: Concatenation
+### Phase 2: Concatenation (cascade-order preserving)
 
-Unique CSS files are concatenated in lexicographic order by root-relative path.
-This is deterministic across runs. The result is written to a fixed path:
+CSS files are concatenated in an order that preserves the CSS cascade:
+
+1. **Canonical order from `index.html`** — the `<link>` sequence in the root
+   `index.html` defines the primary concatenation order. This preserves the
+   relative cascade order for every stylesheet shared across pages (CMSes,
+   static site generators, and hand-built sites all load shared stylesheets in
+   a consistent order from a shared `<head>` template).
+
+2. **Page-specific extras appended** — CSS files not referenced by `index.html`
+   are appended in alphabetical order. These are page-specific stylesheets
+   (e.g. WooCommerce styles on a shop page) that don't appear on the root page.
+   Appending them last is correct because page-specific overrides should always
+   come later in the cascade than shared styles.
+
+This approach is correct for any site where:
+- All pages share a common `<head>` template that loads shared CSS in a
+  consistent order (true for every CMS, SSG, and hand-built site).
+- Per-page CSS additions are overrides, not overridden-by-shared-styles
+  (if they were, the site was already broken before bundling).
+
+The result is written to a fixed path:
 
 ```
 {bundle-dir}/bundle.css
@@ -264,7 +283,58 @@ replaces the old bundle `<link>` with an identical new one.
 - **No media query wrapping** — files linked with `media="screen"` are bundled
   without wrapping, which is safe since `screen` is the default medium.
   Media-specific links (`print`, `max-width`, etc.) are preserved as-is.
-- **Lexicographic ordering** — CSS files are concatenated in alphabetical
-  order by root-relative path, which may not match the original cascade order.
-  This works correctly when CSS specificity and source order don't interact
-  across files, which is the common case for WordPress themes.
+- **Canonical order from index.html** — the bundle concatenation order is
+  derived from the root `index.html`'s `<link>` sequence. Sites without an
+  `index.html` fall back to alphabetical ordering, which may not match the
+  original cascade.
+
+---
+
+# Minification floor
+
+After `extract-css` → `bundle-css`, the CSS pipeline reaches a practical
+minification floor. Here is what has been done and what remains.
+
+## What is done
+
+| Step | Where | Effect |
+|---|---|---|
+| Inline `<style>` extraction | `extract-css` | Deduplicates identical blocks via content-addressing |
+| Monolithic bundling | `bundle-css` | Merges all stylesheets into a single file |
+| Comment stripping | `bundle-css` concatenation | Removes all `/* ... */` comments including `sourceURL`, `sourceMappingURL`, and license headers |
+
+For a typical WordPress site, the source CSS files are already minified
+(`style.min.css`) by the theme/plugin build pipeline. The comment strip
+removes the only remaining non-minified content (source map annotations).
+
+## What remains
+
+**Whitespace and syntax micro-optimizations** — shortening hex colors,
+removing unnecessary whitespace, collapsing redundant values. These save
+1–2% on files not already minified (primarily the `localized-css/` files
+produced by `extract-css`). Negligible for sites where source CSS is
+already minified.
+
+**Dead-code elimination** — removing CSS rules that don't match any HTML
+element on any page. This is the largest theoretical saving, but requires
+a full DOM+CSSOM cross-analysis:
+
+1. Parse every HTML file to collect all used classes, IDs, and element types
+2. Parse every CSS file to find all selectors
+3. Build a used-selector mapping
+4. Rewrite both CSS selectors *and* the HTML `class`/`id` attributes
+   (to keep them consistent if names are shortened)
+
+No general-purpose Rust tool performs this cross-format analysis.
+CSS Modules does it at build time for applications with full control over
+both templates and stylesheets. For a static site archive — where classes
+may be added dynamically by JavaScript, and selectors may target elements
+from multiple pages — the analysis is fragile and incomplete by nature.
+
+The `minify-html` crate is HTML-only. Its CSS feature minifies CSS syntax
+within `<style>` blocks and `style=` attributes, but has no awareness of
+which selectors match which elements — it cannot perform name minimization
+across HTML and CSS.
+
+**Verdict**: the comment stripping in `bundle-css` is the last safe,
+high-leverage CSS optimization available for a static site archive.

@@ -1,10 +1,10 @@
-use xxhash_rust::xxh3::xxh3_64;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use xxhash_rust::xxh3::xxh3_64;
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
@@ -149,9 +149,8 @@ pub fn download_and_rewrite(
                             ref_url.to_string()
                         };
                         let dest = cfg.root.join(asset_path(url, cfg.assets_dir));
-                        let result = download_one(
-                            &agent, url, &referer, &dest, timeout, retries, &ua,
-                        );
+                        let result =
+                            download_one(&agent, url, &referer, &dest, timeout, retries, &ua);
                         let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         eprint!("\r  Downloading: {done}/{download_total}");
                         let _ = std::io::stderr().flush();
@@ -186,8 +185,10 @@ pub fn download_and_rewrite(
     // Phase 2: rewrite HTML files in parallel.
     let rewritten = Mutex::new(FxHashSet::default());
     let broken_urls = Mutex::new(FxHashSet::default());
-    let file_list: Vec<(String, FxHashSet<String>)> =
-        file_urls.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let file_list: Vec<(String, FxHashSet<String>)> = file_urls
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     if !file_list.is_empty() {
         let _ = crossbeam::thread::scope(|s| {
@@ -318,7 +319,7 @@ fn download_one(
     for attempt in 0..=retries {
         match fetch_with_redirects(agent, &encoded_url, referer, user_agent) {
             Ok((status, body)) => {
-                if status >= 200 && status < 300 {
+                if (200..300).contains(&status) {
                     if body.is_empty() {
                         let _ = std::fs::remove_file(&tmp);
                         return Err((true, "empty response body".into()));
@@ -438,8 +439,7 @@ fn looks_like_html(data: &[u8]) -> bool {
 }
 
 fn has_prefix_ignore_ascii_case(haystack: &[u8], prefix: &[u8]) -> bool {
-    haystack.len() >= prefix.len()
-        && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(test)]

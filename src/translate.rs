@@ -3,9 +3,9 @@
 //! Uses html5gum for tokenization and macos-translate (Apple on-device
 //! Translation.framework) for translation.
 
+use apple_translate_rs_sync::{LanguageTranslator, TranslationError, TranslationRequest};
 use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
-use apple_translate_rs_sync::{LanguageTranslator, TranslationError, TranslationRequest};
 use std::ops::Range;
 use std::path::Path;
 
