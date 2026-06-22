@@ -17,8 +17,9 @@ struct Args {
     json: bool,
     verbose: bool,
     jobs: usize,
-    // check-remote --download
+    // check
     download: bool,
+    clean: bool,
     timeout: u32,
     retries: u32,
     force: bool,
@@ -42,6 +43,7 @@ impl Default for Args {
             verbose: false,
             jobs: 0,
             download: false,
+            clean: false,
             timeout: 30,
             retries: 3,
             force: false,
@@ -62,10 +64,10 @@ localize — maintenance toolkit for static HTML sites.
 Usage: localize <command> [ROOT] [flags]
 
 Commands:
-  check-remote  Find remote media URLs in HTML files.  With --download,
-                also fetch those assets and rewrite HTML to use local paths.
-  clean         Find and fix broken local links by unwrapping dead <a> tags
-                and removing dead resource elements.
+  check         Find remote media URLs and broken local links in HTML files.
+                With --download, fetch remote assets and rewrite HTML to use
+                local paths.  With --clean, fix broken local links by
+                unwrapping dead <a> tags and removing dead resource elements.
   zap           Remove HTML elements matching a CSS selector whose inner text
                 contains a query string. Dry-run by default, --apply to remove.
   towebp        Replace .jpg/.jpeg/.png URL extensions with .webp in href,
@@ -81,16 +83,14 @@ Common flags:
   --jobs <n>            Max parallel workers [default: CPUs × 4].
   --help, -h            Print this help and exit.
 
-Check-remote flags:
+Check flags:
   --download            Download assets and rewrite HTML (default is scan only).
+  --clean               Fix broken local links (default is scan only).
   --timeout <s>         Download timeout in seconds [default: 30].
   --retries <n>         Download retry count [default: 3].
   --force               Re-download even if asset already exists.
   --user-agent <str>    Custom User-Agent header.
   --referer <str>       Custom Referer header.
-
-Clean flags:
-  --force               Apply fixes (dry-run by default).
 
 Zap flags:
   --apply               Apply removals (dry-run by default).
@@ -99,9 +99,9 @@ Towebp flags:
   --apply               Apply rewrites (dry-run by default).
 
 Examples:
-  localize check-remote ~/mysite
-  localize check-remote ~/mysite --download
-  localize clean ~/mysite --force
+  localize check ~/mysite
+  localize check ~/mysite --download
+  localize check ~/mysite --clean
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply"
     );
@@ -124,7 +124,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.command = Some(val.string()?);
             }
             _ => {
-                return Err("expected subcommand (check-remote, clean, zap, or towebp)".into());
+                return Err("expected subcommand (check, zap, or towebp)".into());
             }
         }
     }
@@ -195,6 +195,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("download") => {
                 args.download = true;
+            }
+            Long("clean") => {
+                args.clean = true;
             }
             Long("apply") => {
                 args.apply = true;
@@ -503,7 +506,7 @@ fn dedup_broken(refs: Vec<MediaReference>) -> Vec<MediaReference> {
     out
 }
 
-fn cmd_check_remote(args: Args) -> Result<(), String> {
+fn cmd_check(args: Args) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
 
     let root = args.root.as_ref().ok_or("missing root")?;
@@ -545,131 +548,217 @@ fn cmd_check_remote(args: Args) -> Result<(), String> {
             if args.verbose {
                 eprintln!("No remote references found.");
             }
-            return Ok(());
-        }
+        } else {
+            let unique_urls: Vec<String> = {
+                let mut seen = FxHashSet::default();
+                let mut urls = Vec::new();
+                for r in &remote_refs {
+                    if seen.insert(&r.url) {
+                        urls.push(r.url.to_string());
+                    }
+                }
+                urls
+            };
 
-        let unique_urls: Vec<String> = {
-            let mut seen = FxHashSet::default();
-            let mut urls = Vec::new();
-            for r in &remote_refs {
-                if seen.insert(&r.url) {
-                    urls.push(r.url.to_string());
+            let new_urls: Vec<String> = if args.force {
+                unique_urls.clone()
+            } else {
+                unique_urls
+                    .iter()
+                    .filter(|u| {
+                        let rel = asset_path(u, &args.assets_dir);
+                        !Path::new(root).join(&rel).is_file()
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            let file_urls: FxHashMap<String, FxHashSet<String>> = {
+                let mut map: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+                for r in &remote_refs {
+                    map.entry(r.file_path.to_string())
+                        .or_default()
+                        .insert(r.url.to_string());
+                }
+                map
+            };
+            let total_files = file_urls.len();
+            eprintln!(
+                "Downloading {} asset(s) across {} file(s) ({} already present)...",
+                new_urls.len(),
+                total_files,
+                unique_urls.len() - new_urls.len()
+            );
+
+            let dl_jobs = if args.jobs == 0 { 8 } else { args.jobs };
+            let dl_cfg = DownloadConfig {
+                root: Path::new(root),
+                assets_dir: &args.assets_dir,
+                timeout: args.timeout,
+                retries: args.retries,
+                user_agent: &args.user_agent,
+                referer: &args.referer,
+                force: args.force,
+                verbose: args.verbose,
+                jobs: dl_jobs,
+            };
+            let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
+
+            if !broken_urls.is_empty() {
+                eprintln!(
+                    "{} URL(s) returned 404 — attributes renamed to data-broken-*:",
+                    broken_urls.len()
+                );
+                for u in broken_urls.iter().take(10) {
+                    eprintln!("  {u}");
+                }
+                if broken_urls.len() > 10 {
+                    eprintln!("  ... and {} more", broken_urls.len() - 10);
                 }
             }
-            urls
-        };
 
-        let new_urls: Vec<String> = if args.force {
-            unique_urls.clone()
-        } else {
-            unique_urls
-                .iter()
-                .filter(|u| {
-                    let rel = asset_path(u, &args.assets_dir);
-                    !Path::new(root).join(&rel).is_file()
-                })
-                .cloned()
-                .collect()
-        };
-
-        let file_urls: FxHashMap<String, FxHashSet<String>> = {
-            let mut map: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-            for r in &remote_refs {
-                map.entry(r.file_path.to_string())
-                    .or_default()
-                    .insert(r.url.to_string());
+            let skipped: Vec<&String> = file_urls
+                .keys()
+                .filter(|f| !rewritten.contains(*f))
+                .collect();
+            if !skipped.is_empty() {
+                eprintln!(
+                    "Skipped {} file(s) with transient failures (re-run to retry):",
+                    skipped.len()
+                );
+                for f in &skipped {
+                    eprintln!("  {f}");
+                }
             }
-            map
-        };
-        let total_files = file_urls.len();
-        eprintln!(
-            "Downloading {} asset(s) across {} file(s) ({} already present)...",
-            new_urls.len(),
-            total_files,
-            unique_urls.len() - new_urls.len()
-        );
 
-        let dl_jobs = if args.jobs == 0 { 8 } else { args.jobs };
-        let dl_cfg = DownloadConfig {
-            root: Path::new(root),
-            assets_dir: &args.assets_dir,
-            timeout: args.timeout,
-            retries: args.retries,
-            user_agent: &args.user_agent,
-            referer: &args.referer,
-            force: args.force,
-            verbose: args.verbose,
-            jobs: dl_jobs,
-        };
-        let (rewritten, broken_urls) = rt.block_on(download_and_rewrite(&file_urls, &dl_cfg));
+            let rewritten_files: Vec<String> = rewritten.iter().cloned().collect();
+            let stray = verify_no_remote(&rewritten_files, root);
+            if !stray.is_empty() {
+                eprintln!(
+                    "WARNING: {} file(s) still contain remote URLs:",
+                    stray.len()
+                );
+                for s in &stray {
+                    eprintln!("  {s}");
+                }
+            }
 
-        if !broken_urls.is_empty() {
             eprintln!(
-                "{} URL(s) returned 404 — attributes renamed to data-broken-*:",
-                broken_urls.len()
-            );
-            for u in broken_urls.iter().take(10) {
-                eprintln!("  {u}");
-            }
-            if broken_urls.len() > 10 {
-                eprintln!("  ... and {} more", broken_urls.len() - 10);
-            }
-        }
-
-        let skipped: Vec<&String> = file_urls
-            .keys()
-            .filter(|f| !rewritten.contains(*f))
-            .collect();
-        if !skipped.is_empty() {
-            eprintln!(
-                "Skipped {} file(s) with transient failures (re-run to retry):",
+                "Done. {} unique URL(s), {} file(s) rewritten, {} skipped.",
+                unique_urls.len(),
+                rewritten.len(),
                 skipped.len()
             );
-            for f in &skipped {
-                eprintln!("  {f}");
-            }
         }
+    }
 
-        let rewritten_files: Vec<String> = rewritten.iter().cloned().collect();
-        let stray = verify_no_remote(&rewritten_files, root);
-        if !stray.is_empty() {
+    if args.clean {
+        let broken_refs: Vec<&MediaReference> = refs.iter().filter(|r| r.broken).collect();
+        if broken_refs.is_empty() {
+            eprintln!("No broken local links to clean.");
+        } else {
+            let mut file_broken: FxHashMap<String, Vec<&MediaReference>> = FxHashMap::default();
+            for r in &broken_refs {
+                file_broken
+                    .entry(r.file_path.to_string())
+                    .or_default()
+                    .push(r);
+            }
             eprintln!(
-                "WARNING: {} file(s) still contain remote URLs:",
-                stray.len()
+                "Cleaning {} broken link(s) in {} file(s)...",
+                broken_refs.len(),
+                file_broken.len()
             );
-            for s in &stray {
-                eprintln!("  {s}");
+
+            let cleaned = Arc::new(AtomicUsize::new(0));
+            let errors: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            rt.block_on(async {
+                let sem = Arc::new(Semaphore::new(jobs));
+                let mut handles = Vec::with_capacity(file_broken.len());
+                for rel in file_broken.keys() {
+                    let rel = rel.clone();
+                    let sem = sem.clone();
+                    let cleaned = cleaned.clone();
+                    let errors = errors.clone();
+                    let href_set = href_set.clone();
+                    let root = root.to_string();
+                    let handle = tokio::spawn(async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        tokio::task::spawn_blocking(move || {
+                            let path = Path::new(&root).join(&rel);
+                            let content = std::fs::read_to_string(&path).unwrap_or_default();
+                            match crate::rewriter::clean_html(&content, &href_set, &rel) {
+                                Ok(new_html) => {
+                                    let tmp = path.with_extension("tmp");
+                                    if let Err(e) = std::fs::write(&tmp, &new_html).map_err(|e| format!("write tmp: {e}"))
+                                        .and_then(|_| {
+                                            std::fs::rename(&tmp, &path)
+                                                .map_err(|e| format!("rename: {e}"))
+                                        })
+                                    {
+                                        errors.lock().unwrap().push(format!("{rel}: {e}"));
+                                    } else {
+                                        cleaned.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    errors.lock().unwrap().push(format!("{rel}: {e}"));
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap()
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    let _ = handle.await;
+                }
+            });
+
+            let errors = errors.lock().unwrap();
+            if !errors.is_empty() {
+                eprintln!("Errors:");
+                for e in errors.iter() {
+                    eprintln!("  {e}");
+                }
             }
-        }
 
-        if args.json {
-            print_json(&refs);
+            eprintln!(
+                "Cleaned {} broken link(s) in {} file(s).",
+                broken_refs.len(),
+                cleaned.load(Ordering::Relaxed)
+            );
         }
+    }
 
-        eprintln!(
-            "Done. {} unique URL(s), {} file(s) rewritten, {} skipped.",
-            unique_urls.len(),
-            rewritten.len(),
-            skipped.len()
-        );
-    } else {
+    if !args.download && !args.clean {
         if args.json {
             print_json(&refs);
         } else {
             print_human(&refs);
         }
+        let broken = refs.iter().filter(|r| r.broken).count();
+        let remote = refs.len() - broken;
+        eprintln!(
+            "Dry-run: {} broken-local-url, {} remote-url in {} file(s).",
+            broken,
+            remote,
+            files.len()
+        );
+    }
 
-        if args.verbose {
-            let unique_broken = refs.iter().filter(|r| r.broken).count();
-            let remote = refs.len() - unique_broken;
-            eprintln!(
-                "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
-                refs.len(),
-                files.len(),
-                unique_broken,
-                remote,
-            );
-        }
+    if args.verbose {
+        let unique_broken = refs.iter().filter(|r| r.broken).count();
+        let remote = refs.len() - unique_broken;
+        eprintln!(
+            "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
+            refs.len(),
+            files.len(),
+            unique_broken,
+            remote,
+        );
     }
 
     Ok(())
@@ -690,178 +779,6 @@ fn verify_no_remote(files: &[String], root: &str) -> Vec<String> {
         }
     }
     stray
-}
-
-fn cmd_clean(args: Args) -> Result<(), String> {
-    let root = args.root.as_ref().ok_or("missing root")?;
-    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
-    let include: &[String] = if args.include.is_empty() {
-        &default_include
-    } else {
-        &args.include
-    };
-    let jobs = if args.jobs == 0 {
-        num_cpus() * 4
-    } else {
-        args.jobs
-    };
-    let force = args.force;
-    let verbose = args.verbose;
-
-    eprintln!("Discovering HTML files in {root}...");
-    let files = iter_html_files(root, include, &args.exclude);
-
-    if verbose {
-        eprintln!("Found {} HTML file(s) to scan", files.len());
-    }
-    if files.is_empty() {
-        eprintln!("No HTML files found.");
-        return Ok(());
-    }
-
-    if force {
-        eprintln!("Cleaning {} file(s) with {jobs} workers...", files.len());
-    } else {
-        eprintln!(
-            "Dry-run: scanning {} file(s) with {jobs} workers...",
-            files.len()
-        );
-    }
-
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio: {e}"))?;
-    let root_path = std::path::Path::new(root);
-
-    eprintln!("Building file index...");
-    let href_set = Arc::new(crate::clean::build_href_set(root_path));
-    if verbose {
-        eprintln!("Indexed {} file(s)", href_set.len());
-    }
-
-    let (total_broken, mut file_results, errors) = rt.block_on(async {
-        let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
-        let counter = Arc::new(AtomicUsize::new(0));
-        let file_total = files.len();
-
-        let mut handles = Vec::with_capacity(files.len());
-        for rel in &files {
-            let rel = rel.clone();
-            let sem = sem.clone();
-            let counter = counter.clone();
-            let root_path = root_path.to_path_buf();
-            let href_set = href_set.clone();
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || {
-                    let path = root_path.join(&rel);
-                    let content = std::fs::read_to_string(&path).unwrap_or_default();
-                    let scan = crate::clean::scan_file(&rel, &content, &href_set);
-                    if let Some(err) = &scan.error {
-                        return (rel.clone(), Err(format!("{}: {err}", path.display())));
-                    }
-                    if !scan.broken_links.is_empty() && force {
-                        match crate::rewriter::clean_html(&content, &href_set, &rel) {
-                            Ok(new_html) => {
-                                let tmp = path.with_extension("tmp");
-                                if let Err(e) = std::fs::write(&tmp, &new_html)
-                                    .map_err(|e| format!("write tmp: {e}"))
-                                    .and_then(|_| {
-                                        std::fs::rename(&tmp, &path)
-                                            .map_err(|e| format!("rename: {e}"))
-                                    })
-                                {
-                                    return (rel.clone(), Err(format!("{}: {e}", path.display())));
-                                }
-                            }
-                            Err(e) => {
-                                return (rel.clone(), Err(format!("{}: {e}", path.display())));
-                            }
-                        }
-                    }
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if !verbose {
-                        if done.is_multiple_of(16) {
-                            eprint!("\rScanning: {done}/{file_total} files");
-                        }
-                        let _ = std::io::stderr().flush();
-                    }
-                    (
-                        rel.clone(),
-                        Ok(crate::clean::CleanResult {
-                            broken_links: scan.broken_links,
-                            error: scan.error,
-                        }),
-                    )
-                })
-                .await
-                .unwrap()
-            });
-            handles.push(handle);
-        }
-
-        let mut total_broken = 0usize;
-        let mut errors = Vec::new();
-        let mut file_results: Vec<(String, Vec<crate::clean::BrokenLink>)> = Vec::new();
-
-        for handle in handles {
-            match handle.await {
-                Ok((rel, Ok(result))) => {
-                    if !result.broken_links.is_empty() {
-                        total_broken += result.broken_links.len();
-                        file_results.push((rel, result.broken_links));
-                    }
-                }
-                Ok((rel, Err(e))) => {
-                    errors.push((rel, e));
-                }
-                Err(e) => {
-                    errors.push((String::new(), format!("join error: {e}")));
-                }
-            }
-        }
-
-        (total_broken, file_results, errors)
-    });
-
-    if !verbose && !files.is_empty() {
-        eprintln!();
-    }
-
-    if !errors.is_empty() {
-        eprintln!("Errors:");
-        for (rel, err) in &errors {
-            if rel.is_empty() {
-                eprintln!("  {err}");
-            } else {
-                eprintln!("  {rel}: {err}");
-            }
-        }
-    }
-
-    // Print per-file broken links in hyperlink's format.
-    file_results.sort_by(|a, b| a.0.cmp(&b.0));
-    for (rel, links) in &file_results {
-        println!("./{rel}");
-        for link in links {
-            println!("  <{} {}=\"{}\">", link.tag, link.attr, link.url);
-        }
-        println!();
-    }
-
-    if force {
-        eprintln!(
-            "Cleaned {} broken link(s) in {} file(s).",
-            total_broken,
-            file_results.len()
-        );
-    } else {
-        eprintln!(
-            "Dry-run: found {} broken link(s) in {} file(s). Run with --force to fix.",
-            total_broken,
-            file_results.len()
-        );
-    }
-
-    Ok(())
 }
 
 fn cmd_zap(args: Args) -> Result<(), String> {
@@ -1048,7 +965,6 @@ fn cmd_zap(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-
 /// Split a URL from an optional descriptor (e.g. "image.jpg 400w" → ("image.jpg", "400w")).
 fn split_url_descriptor(entry: &str) -> (&str, &str) {
     entry.split_once(' ').unwrap_or((entry, ""))
@@ -1078,14 +994,11 @@ fn system_available_memory_bytes() -> u64 {
             let mut free = 0u64;
             let mut inactive = 0u64;
             for line in out.lines() {
-                if let Some(rest) = line.strip_prefix("Pages free:")
+                if let Some(rest) = line
+                    .strip_prefix("Pages free:")
                     .or_else(|| line.strip_prefix("Pages inactive:"))
                 {
-                    let val: u64 = rest
-                        .trim_end_matches('.')
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
+                    let val: u64 = rest.trim_end_matches('.').trim().parse().unwrap_or(0);
                     if line.contains("free") {
                         free = val;
                     } else {
@@ -1105,11 +1018,7 @@ fn system_available_memory_bytes() -> u64 {
             let mut available: u64 = 0;
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    let kb: u64 = rest
-                        .trim_end_matches(" kB")
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
+                    let kb: u64 = rest.trim_end_matches(" kB").trim().parse().unwrap_or(0);
                     if kb > 0 {
                         available = kb * 1024;
                         break;
@@ -1222,8 +1131,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                         Ok((rel, matches)) => {
                             for m in &matches {
                                 let (url, _desc) = split_url_descriptor(&m.url);
-                                let resolved =
-                                    crate::rewriter::resolve_html_url(&rel, url);
+                                let resolved = crate::rewriter::resolve_html_url(&rel, url);
                                 if let Ok(mut guard) = unique_mu.lock() {
                                     guard.insert(resolved);
                                 }
@@ -1400,9 +1308,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             eprintln!();
         }
 
-        eprintln!(
-            "Converted {converted_count}, failed {failed_count}, skipped {skipped_count}.",
-        );
+        eprintln!("Converted {converted_count}, failed {failed_count}, skipped {skipped_count}.",);
         if converted.is_empty() {
             eprintln!("No images converted; HTML will not be modified.");
         }
@@ -1434,11 +1340,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     let all_matches = crate::towebp::scan_towebp(&content);
                     if apply_flag {
-                        match crate::rewriter::towebp_html(
-                            &content,
-                            &rel,
-                            &converted,
-                        ) {
+                        match crate::rewriter::towebp_html(&content, &rel, &converted) {
                             Ok(new_html) => {
                                 let tmp = path.with_extension("tmp");
                                 if let Err(e) = std::fs::write(&tmp, &new_html)
@@ -1463,8 +1365,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
                             .into_iter()
                             .filter(|m| {
                                 let (url, _desc) = split_url_descriptor(&m.url);
-                                let resolved =
-                                    crate::rewriter::resolve_html_url(&rel, url);
+                                let resolved = crate::rewriter::resolve_html_url(&rel, url);
                                 converted.contains(&resolved)
                             })
                             .collect()
@@ -1534,7 +1435,10 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             let old_resolved = crate::rewriter::resolve_html_url(rel, old_url);
             let new_resolved = crate::rewriter::resolve_html_url(rel, new_url);
             if old_desc.is_empty() {
-                println!("  {} {}: {} → {}", m.tag, m.attr, old_resolved, new_resolved);
+                println!(
+                    "  {} {}: {} → {}",
+                    m.tag, m.attr, old_resolved, new_resolved
+                );
             } else {
                 println!(
                     "  {} {}: {} {} → {} {}",
@@ -1601,26 +1505,25 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
     };
 
     let result = match args.command.as_deref() {
-        Some("check-remote") => cmd_check_remote(args),
-        Some("clean") => cmd_clean(args),
+        Some("check") => cmd_check(args),
         Some("zap") => cmd_zap(args),
         Some("towebp") => cmd_towebp(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (scan, apply, clean, zap, or towebp)");
-            eprintln!("Usage: localize <check-remote|clean|zap|towebp> [ROOT] [flags]");
+            eprintln!("localize: expected subcommand (check, zap, or towebp)");
+            eprintln!("Usage: localize <check|zap|towebp> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }

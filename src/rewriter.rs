@@ -515,11 +515,7 @@ pub fn towebp_html(
 
 /// Like towebp_srcset_value, but only rewrites URLs whose resolved file path
 /// is in the `converted` set.
-fn towebp_srcset_value_gated(
-    val: &str,
-    file_rel: &str,
-    converted: &FxHashSet<String>,
-) -> String {
+fn towebp_srcset_value_gated(val: &str, file_rel: &str, converted: &FxHashSet<String>) -> String {
     val.split(',')
         .map(|p| {
             let fields: Vec<&str> = p.split_whitespace().collect();

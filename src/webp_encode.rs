@@ -37,7 +37,9 @@ fn decode_png(path: &Path) -> Result<(Vec<u8>, PixelLayout, u32, u32), String> {
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|e| format!("png info: {e}"))?;
     let mut buf = vec![0; reader.output_buffer_size().unwrap_or(0)];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("png decode: {e}"))?;
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("png decode: {e}"))?;
     buf.truncate(info.buffer_size());
 
     // Convert grayscale to RGB(A) since zenwebp doesn't accept grayscale directly.

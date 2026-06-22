@@ -1,55 +1,4 @@
-use html5gum::Tokenizer;
-use html5gum::emitters::default::DefaultEmitter;
 use rustc_hash::FxHashSet;
-use std::path::Path;
-
-#[derive(Debug, Clone)]
-pub struct BrokenLink {
-    pub url: String,
-    pub tag: String,
-    pub attr: String,
-    #[allow(dead_code)]
-    pub line: usize,
-}
-
-#[derive(Debug)]
-pub struct CleanResult {
-    pub broken_links: Vec<BrokenLink>,
-    pub error: Option<String>,
-}
-
-/// Build the set of all canonical hrefs defined by files on disk.
-/// Every file under `root` contributes its relative path as a canonical href.
-/// `index.html` / `index.htm` files contribute their parent directory instead.
-pub fn build_href_set(root: &Path) -> FxHashSet<String> {
-    let mut set = FxHashSet::default();
-    for entry in walkdir::WalkDir::new(root) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-
-        let href = if rel_str.ends_with("/index.html") || rel_str.ends_with("/index.htm") {
-            // Strip the filename, leaving the directory path.
-            match rel_str.rfind('/') {
-                Some(pos) => &rel_str[..pos],
-                None => "", // root index.html → empty string
-            }
-        } else if rel_str == "index.html" || rel_str == "index.htm" {
-            ""
-        } else {
-            &rel_str
-        };
-
-        set.insert(href.to_string());
-    }
-    set
-}
 
 /// Check whether a URL has an external scheme (http, mailto, etc.).
 /// Matches hyperlink's `is_external_link`.
@@ -286,143 +235,9 @@ pub(crate) fn link_exists(
     href_set.contains(raw)
 }
 
-fn tag_attrs(tag: &[u8]) -> Option<&'static [&'static str]> {
-    match tag {
-        b"a" | b"area" | b"link" => Some(&["href"]),
-        b"img" => Some(&["src", "srcset"]),
-        b"script" | b"iframe" => Some(&["src"]),
-        b"object" => Some(&["data"]),
-        _ => None,
-    }
-}
-
-fn line_of_offset(source: &str, offset: usize) -> usize {
-    let prefix = &source[..offset.min(source.len())];
-    prefix.bytes().filter(|&b| b == b'\n').count() + 1
-}
-
-/// Parse the HTML and find all broken local links.
-/// `href_set` is the pre-built set of canonical hrefs from `build_href_set`.
-pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> CleanResult {
-    // Compute the document's canonical href for resolving relative links.
-    // Kept as an owned String so we have a stable borrow for the &str used by resolve_href.
-    let normalized = file_path.replace('\\', "/");
-    let (doc_href, doc_is_index): (String, bool) =
-        if normalized.ends_with("/index.html") || normalized.ends_with("/index.htm") {
-            match normalized.rfind('/') {
-                Some(pos) => (normalized[..pos].to_string(), true),
-                None => (String::new(), true),
-            }
-        } else if normalized == "index.html" || normalized == "index.htm" {
-            (String::new(), true)
-        } else {
-            (normalized, false)
-        };
-    let doc_href = doc_href.as_str();
-
-    let mut broken: Vec<BrokenLink> = Vec::new();
-    let mut scratch = String::new();
-    let mut decode_buf = String::new();
-
-    let tokenizer = Tokenizer::new_with_emitter(html, DefaultEmitter::<usize>::new_with_span());
-
-    for token_result in tokenizer {
-        let token = match token_result {
-            Ok(t) => t,
-            Err(e) => {
-                return CleanResult {
-                    broken_links: broken,
-                    error: Some(format!("Parse error: {e}")),
-                };
-            }
-        };
-
-        if let html5gum::Token::StartTag(tag) = token {
-            let tag_name = &tag.name[..];
-            let attrs_to_check = tag_attrs(tag_name);
-
-            let Some(attrs_to_check) = attrs_to_check else {
-                continue;
-            };
-
-            for (name, attr) in &tag.attributes {
-                let attr_name = std::str::from_utf8(&name[..])
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if !attrs_to_check.contains(&attr_name.as_str()) {
-                    continue;
-                }
-                let attr_value = std::str::from_utf8(&attr[..]).unwrap_or("");
-                let trimmed = attr_value.trim();
-
-                if attr_name == "srcset" {
-                    for (url_str, _descriptor) in parse_srcset_entries(attr_value) {
-                        let url_trimmed = url_str.trim();
-                        if is_local_link(url_trimmed)
-                            && !link_exists(doc_href, doc_is_index, url_trimmed, &mut scratch, &mut decode_buf, href_set)
-                        {
-                            broken.push(BrokenLink {
-                                url: url_str.to_string(),
-                                tag: std::str::from_utf8(tag_name)
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase(),
-                                attr: "srcset".into(),
-                                line: line_of_offset(html, tag.span.start),
-                            });
-                        }
-                    }
-                } else if is_local_link(trimmed)
-                    && !link_exists(doc_href, doc_is_index, trimmed, &mut scratch, &mut decode_buf, href_set)
-                {
-                    broken.push(BrokenLink {
-                        url: attr_value.to_string(),
-                        tag: std::str::from_utf8(tag_name)
-                            .unwrap_or("")
-                            .to_ascii_lowercase(),
-                        attr: attr_name.to_string(),
-                        line: line_of_offset(html, tag.span.start),
-                    });
-                }
-            }
-        }
-    }
-
-    CleanResult {
-        broken_links: broken,
-        error: None,
-    }
-}
-
-fn parse_srcset_entries(raw: &str) -> Vec<(String, Option<String>)> {
-    let mut entries = Vec::new();
-    for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let tokens: Vec<&str> = part.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-        let url = tokens[0];
-        let descriptor = if tokens.len() > 1 {
-            Some(tokens[1..].join(" "))
-        } else {
-            None
-        };
-        entries.push((url.to_string(), descriptor));
-    }
-    entries
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    fn make_set(root: &Path) -> FxHashSet<String> {
-        build_href_set(root)
-    }
 
     #[test]
     fn test_is_local_link() {
@@ -457,38 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_href_set() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::create_dir_all(root.join("picture")).unwrap();
-        std::fs::write(root.join("picture/926.html"), "test").unwrap();
-        std::fs::create_dir_all(root.join("glossary")).unwrap();
-        std::fs::write(root.join("glossary/index.html"), "test").unwrap();
-        std::fs::write(root.join("home.html"), "test").unwrap();
-        std::fs::write(root.join("data.txt"), "test").unwrap();
-
-        let set = make_set(root);
-        assert!(set.contains("picture/926.html"));
-        assert!(set.contains("glossary")); // index.html stripped
-        assert!(set.contains("home.html"));
-        assert!(set.contains("data.txt")); // non-HTML files too
-    }
-
-    #[test]
-    fn test_build_href_set_root_index() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::write(root.join("index.html"), "test").unwrap();
-
-        let set = make_set(root);
-        assert!(set.contains("")); // root index → empty string
-    }
-
-    #[test]
     fn test_resolve_href_relative() {
         let mut scratch = String::new();
         let mut decode = String::new();
-        // From material/1642.html, link to ../picture/926.html
         let result = resolve_href(
             "material/1642.html",
             false,
@@ -517,7 +303,6 @@ mod tests {
     fn test_resolve_href_from_index() {
         let mut scratch = String::new();
         let mut decode = String::new();
-        // From glossary/index.html, link to list.html
         let result = resolve_href("glossary", true, "list.html", &mut scratch, &mut decode);
         assert_eq!(result, "glossary/list.html");
     }
@@ -584,8 +369,6 @@ mod tests {
         assert_eq!(result, "material/1642.html");
     }
 
-    /// Regression: `%23` is a percent-encoded `#` and must survive as a literal
-    /// `#` in the path, not be stripped as a fragment separator.
     #[test]
     fn test_resolve_href_encoded_hash_in_filename() {
         let mut scratch = String::new();
@@ -600,7 +383,6 @@ mod tests {
         assert_eq!(result, "material/#1+q-rok.html");
     }
 
-    /// Regression: `%23` should also work with relative paths.
     #[test]
     fn test_resolve_href_encoded_hash_relative() {
         let mut scratch = String::new();
@@ -620,7 +402,6 @@ mod tests {
     fn test_resolve_href_raw_hash_is_fragment() {
         let mut scratch = String::new();
         let mut decode = String::new();
-        // This should be treated as a self-reference + fragment, not a file lookup.
         let result = resolve_href(
             "material/1246.html",
             false,
@@ -629,121 +410,5 @@ mod tests {
             &mut decode,
         );
         assert_eq!(result, "material/1246.html");
-    }
-
-    /// When the file with an encoded hash in the name actually exists, the
-    /// link should NOT be reported as broken.
-    #[test]
-    fn test_scan_encoded_hash_file_exists() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::create_dir_all(root.join("material")).unwrap();
-        // Create the file with a literal # in its name.
-        std::fs::write(root.join("material/#1+q-rok.html"), "test").unwrap();
-        let set = make_set(root);
-
-        // href uses %23 to encode the #.
-        let html = r#"<a href="%231+q-rok.html">link</a>"#;
-        let result = scan_file("material/1246.html", html, &set);
-        assert_eq!(result.broken_links.len(), 0);
-    }
-
-    /// When the file does NOT exist, the link IS broken.
-    #[test]
-    fn test_scan_encoded_hash_file_missing() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::create_dir_all(root.join("material")).unwrap();
-        // Do NOT create the target file.
-        let set = make_set(root);
-
-        let html = r#"<a href="%231+q-rok.html">link</a>"#;
-        let result = scan_file("material/1246.html", html, &set);
-        assert_eq!(result.broken_links.len(), 1);
-        assert_eq!(result.broken_links[0].url, "%231+q-rok.html");
-    }
-
-    #[test]
-    fn test_scan_a_href_broken() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::create_dir_all(root.join("material")).unwrap();
-        std::fs::create_dir_all(root.join("media")).unwrap();
-        std::fs::write(root.join("media/ok.jpg"), "fake").unwrap();
-        // Note: picture/926.html does NOT exist
-        let set = make_set(root);
-
-        let html = r#"<a href="../picture/926.html"><img src="../media/ok.jpg"></a>"#;
-        let result = scan_file("material/test.html", html, &set);
-        assert!(result.error.is_none());
-        assert_eq!(result.broken_links.len(), 1);
-        let b = &result.broken_links[0];
-        assert_eq!(b.tag, "a");
-        assert_eq!(b.attr, "href");
-        assert_eq!(b.url, "../picture/926.html");
-    }
-
-    #[test]
-    fn test_scan_img_src_broken() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        let set = make_set(root);
-
-        let html = r#"<img src="missing.jpg" alt="x">"#;
-        let result = scan_file("test.html", html, &set);
-        assert!(result.error.is_none());
-        assert_eq!(result.broken_links.len(), 1);
-        let b = &result.broken_links[0];
-        assert_eq!(b.tag, "img");
-    }
-
-    #[test]
-    fn test_scan_ignores_valid_link() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        std::fs::write(root.join("about.html"), "test").unwrap();
-        let set = make_set(root);
-
-        let html = r#"<a href="about.html">About</a>"#;
-        let result = scan_file("test.html", html, &set);
-        assert_eq!(result.broken_links.len(), 0);
-    }
-
-    #[test]
-    fn test_scan_ignores_remote() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        let set = make_set(root);
-
-        let html = r#"<a href="https://example.com/page.html">link</a>"#;
-        let result = scan_file("test.html", html, &set);
-        assert_eq!(result.broken_links.len(), 0);
-    }
-
-    #[test]
-    fn test_scan_ignores_fragment() {
-        let mut set = FxHashSet::default();
-        // The document's own href must be in the set for self-references to be valid.
-        set.insert("test.html".to_string());
-
-        let html = "<a href=\"#section\">link</a>";
-        let result = scan_file("test.html", html, &set);
-        assert_eq!(result.broken_links.len(), 0);
-    }
-
-    #[test]
-    fn test_scan_index_html_link() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let root = tmpdir.path();
-        // Create glossary/index.html and a page that links to it
-        std::fs::create_dir_all(root.join("glossary")).unwrap();
-        std::fs::write(root.join("glossary/index.html"), "test").unwrap();
-        std::fs::create_dir_all(root.join("material")).unwrap();
-        let set = make_set(root);
-
-        // Link to ../glossary/ (with trailing slash) should resolve to "glossary"
-        let html = r#"<a href="../glossary/">Glossary</a>"#;
-        let result = scan_file("material/test.html", html, &set);
-        assert_eq!(result.broken_links.len(), 0);
     }
 }

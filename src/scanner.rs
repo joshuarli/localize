@@ -362,7 +362,14 @@ pub fn scan_file(file_path: &str, html: &str, href_set: &FxHashSet<String>) -> S
 
     // Returns true if a local URL is missing from disk.
     let mut is_broken = |url: &str| -> bool {
-        !crate::clean::link_exists(&doc_href, doc_is_index, url, &mut scratch, &mut decode_buf, href_set)
+        !crate::clean::link_exists(
+            &doc_href,
+            doc_is_index,
+            url,
+            &mut scratch,
+            &mut decode_buf,
+            href_set,
+        )
     };
 
     let tokenizer = Tokenizer::new_with_emitter(html, DefaultEmitter::<usize>::new_with_span());
@@ -1269,12 +1276,14 @@ mod tests {
         // bytes on disk). resolve_href percent-decodes the URL, so the decoded
         // path won't match the encoded filename. The raw fallback must find it.
         let mut set = FxHashSet::default();
-        set.insert(
-            "_grab/example.com/photos/kane_-%E5%85%BC_-test.jpg".to_string(),
-        );
+        set.insert("_grab/example.com/photos/kane_-%E5%85%BC_-test.jpg".to_string());
         let html = r#"<img src="../../_grab/example.com/photos/kane_-%E5%85%BC_-test.jpg">"#;
         let result = scan_file("posts/some-post/index.html", html, &set);
-        assert_eq!(result.references.len(), 0, "should find file via raw fallback");
+        assert_eq!(
+            result.references.len(),
+            0,
+            "should find file via raw fallback"
+        );
     }
 
     #[test]
@@ -1282,7 +1291,8 @@ mod tests {
         // When neither the decoded nor raw path exists, it should be broken.
         let mut set = FxHashSet::default();
         set.insert("_grab/example.com/photos/some-other-file.jpg".to_string());
-        let html = r#"<img src="../../_grab/example.com/photos/missing_kane_-%E5%85%BC_-test.jpg">"#;
+        let html =
+            r#"<img src="../../_grab/example.com/photos/missing_kane_-%E5%85%BC_-test.jpg">"#;
         let result = scan_file("posts/some-post/index.html", html, &set);
         assert_eq!(result.references.len(), 1);
         assert!(result.references[0].broken);
