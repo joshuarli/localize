@@ -645,22 +645,86 @@ fn translate_clusters(
 
 // ── Reconstruction ──────────────────────────────────────────────────────────
 
+/// Escape `&`, `<`, and `>` for safe insertion into HTML text content.
+fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// CSS snippet injected into each translated page. Uses a hidden checkbox at
+/// the top of `<body>` and the `:has()` selector so clicking any translated
+/// element toggles all of them between translation and original globally.
+static TRANSLATE_SNIPPET: &str = concat!(
+    "<input type=\"checkbox\" id=\"localized-toggle\" style=\"display:none\">",
+    "<style>",
+    ".localized-translated-text{cursor:pointer;transition:opacity .15s ease}",
+    ".localized-translated-text:hover{opacity:.82}",
+    ".localized-translated-text .localized-original{display:none}",
+    "html:has(#localized-toggle:checked) .localized-translated-text .localized-translation{display:none}",
+    "html:has(#localized-toggle:checked) .localized-translated-text .localized-original{display:inline}",
+    "</style>",
+);
+
+fn inject_translate_snippet(html: &mut String) {
+    // Place the hidden checkbox + style right after the opening <body> tag.
+    if let Some(pos) = html.find("<body") {
+        if let Some(end) = html[pos..].find('>') {
+            html.insert_str(pos + end + 1, TRANSLATE_SNIPPET);
+            return;
+        }
+    }
+    if let Some(pos) = html.find("<head") {
+        if let Some(end) = html[pos..].find('>') {
+            html.insert_str(pos + end + 1, TRANSLATE_SNIPPET);
+            return;
+        }
+    }
+    html.insert_str(0, TRANSLATE_SNIPPET);
+}
+
 fn apply_translations(html: &str, segments: &[TextSegment]) -> String {
     let mut result = html.to_string();
 
     // Sort descending by span start so earlier spans remain valid after replacement.
-    let mut replacements: Vec<(Range<usize>, &str)> = segments
+    let mut replacements: Vec<(Range<usize>, String)> = segments
         .iter()
         .filter_map(|seg| {
-            seg.translated
-                .as_ref()
-                .map(|t| (seg.span.clone(), t.as_str()))
+            let translated = seg.translated.as_ref()?;
+            let (prefix, core, suffix) = split_ws(&seg.text);
+
+            // `translated` is prefix + translated_core + suffix; extract the core.
+            let translated_core = &translated[prefix.len()..translated.len() - suffix.len()];
+
+            // Use <label> so clicking toggles the global checkbox via :has().
+            // Fall back to <span> inside links/buttons to avoid double-interaction.
+            let is_interactive = matches!(seg.tag.as_str(), "a" | "button");
+            let el = if is_interactive { "span" } else { "label" };
+            let for_attr = if is_interactive { "" } else { " for=\"localized-toggle\"" };
+
+            let wrapped = format!(
+                "{prefix}<{el} class=\"localized-translated-text\"{for_attr}><span class=\"localized-translation\">{translated}</span><span class=\"localized-original\" aria-hidden=\"true\">{original}</span></{el}>{suffix}",
+                prefix = prefix,
+                el = el,
+                for_attr = for_attr,
+                translated = escape_html_text(translated_core),
+                original = core,
+                suffix = suffix,
+            );
+            Some((seg.span.clone(), wrapped))
         })
         .collect();
     replacements.sort_by_key(|b| std::cmp::Reverse(b.0.start));
 
-    for (span, translated) in &replacements {
-        result.replace_range(span.clone(), translated);
+    for (span, replacement) in &replacements {
+        result.replace_range(span.clone(), replacement);
     }
 
     result
@@ -804,7 +868,8 @@ pub fn process_file(
     let summaries = cluster_summaries(&clusters, &segments);
 
     if apply && translated_count > 0 {
-        let new_html = apply_translations(&html, &segments);
+        let mut new_html = apply_translations(&html, &segments);
+        inject_translate_snippet(&mut new_html);
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &new_html).map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path)
@@ -961,7 +1026,11 @@ mod tests {
         segs[1].translated = Some("Deuxième".into());
 
         let result = apply_translations(html, &segs);
-        assert_eq!(result, "<p>Premier</p><p>Deuxième</p>");
+        assert!(result.contains("Premier"));
+        assert!(result.contains("Deuxième"));
+        assert!(result.contains(r#"<label class="localized-translated-text" for="localized-toggle">"#));
+        assert!(result.contains(r#"<span class="localized-original" aria-hidden="true">First</span>"#));
+        assert!(result.contains(r#"<span class="localized-original" aria-hidden="true">Second</span>"#));
     }
 
     #[test]
@@ -970,13 +1039,17 @@ mod tests {
         let mut segs = extract_segments(html);
         assert_eq!(segs.len(), 1);
 
-        // The text includes surrounding whitespace from the text node
         let (prefix, core, suffix) = split_ws(&segs[0].text);
         assert_eq!(core, "Hello");
 
         segs[0].translated = Some(format!("{prefix}Hola{suffix}"));
         let result = apply_translations(html, &segs);
-        assert!(result.contains("Hola"));
+        // Whitespace preserved outside the wrapper
+        assert!(result.contains("Hola</span>"));
+        assert!(result.starts_with("<div>\n  <p>"));
+        assert!(result.contains("\n</div>"));
+        // Original text preserved
+        assert!(result.contains(r#"<span class="localized-original" aria-hidden="true">Hello</span>"#));
     }
 
     #[test]
@@ -990,5 +1063,69 @@ mod tests {
         let html = "<script>code</script><style>css</style>";
         let segs = extract_segments(html);
         assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn test_escape_html_text() {
+        assert_eq!(escape_html_text("hello"), "hello");
+        assert_eq!(escape_html_text("a < b"), "a &lt; b");
+        assert_eq!(escape_html_text("a & b"), "a &amp; b");
+        assert_eq!(escape_html_text("<script>"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn test_inject_translate_snippet() {
+        let mut html = "<html><head></head><body><p>hi</p></body></html>".to_string();
+        inject_translate_snippet(&mut html);
+        assert!(html.contains("localized-translated-text"));
+        assert!(html.contains("localized-toggle"));
+        assert!(html.contains(":has("));
+        // Snippet inserted right after <body>
+        let body_pos = html.find("<body").unwrap();
+        let toggle_pos = html.find("localized-toggle").unwrap();
+        assert!(toggle_pos > body_pos);
+    }
+
+    #[test]
+    fn test_inject_translate_snippet_no_body() {
+        let mut html = "<html><head></head><p>hi</p></html>".to_string();
+        inject_translate_snippet(&mut html);
+        assert!(html.contains("localized-translated-text"));
+    }
+
+    #[test]
+    fn test_apply_translations_uses_span_for_links() {
+        let html = r#"<a href="/">Home</a>"#;
+        let mut segs = extract_segments(html);
+        // "Home" is inside <a>; should get <span> wrapper not <label>
+        segs[0].translated = Some("Accueil".into());
+        let result = apply_translations(html, &segs);
+        assert!(result.contains(r#"<span class="localized-translated-text">"#));
+        assert!(!result.contains("<label"));
+    }
+
+    #[test]
+    fn test_apply_translations_escapes_html() {
+        let html = "<p>x</p>";
+        let mut segs = extract_segments(html);
+        segs[0].translated = Some("<script>alert('hi')</script>".into());
+        let result = apply_translations(html, &segs);
+        // The translated text should be escaped
+        assert!(result.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_apply_translations_preserves_original() {
+        let html = "<p>Hello &amp; welcome</p>";
+        let mut segs = extract_segments(html);
+        // The extracted text includes the raw HTML entity
+        let core = split_ws(&segs[0].text).1;
+        assert_eq!(core, "Hello &amp; welcome");
+        segs[0].translated = Some("Bonjour &amp; bienvenue".into());
+        let result = apply_translations(html, &segs);
+        // Original preserved as-is (raw HTML source)
+        assert!(result.contains(r#"<span class="localized-original" aria-hidden="true">Hello &amp; welcome</span>"#));
+        // Translated text is HTML-escaped (the & in the translation gets double-escaped)
+        assert!(result.contains("Bonjour &amp;amp; bienvenue"));
     }
 }
