@@ -380,7 +380,7 @@ fn scan_all(
     let root_path = Path::new(root);
     let href_set = Arc::new(href_set.clone());
 
-    std::thread::scope(|s| {
+    let _ = crossbeam::thread::scope(|s| {
         let files: &[String] = files;
         let all_refs: &std::sync::Mutex<Vec<MediaReference>> = &all_refs;
         let errors: &std::sync::Mutex<Vec<String>> = &errors;
@@ -389,7 +389,7 @@ fn scan_all(
         for _ in 0..workers {
             let index = Arc::clone(&index);
             let href_set = href_set.clone();
-            s.spawn(move || {
+            s.spawn(move |_| {
                 loop {
                     let i = index.fetch_add(1, Ordering::Relaxed);
                     if i >= total {
@@ -717,7 +717,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let clean_files: Vec<String> = file_broken.keys().cloned().collect();
             let clean_total = clean_files.len();
-            std::thread::scope(|s| {
+            let _ = crossbeam::thread::scope(|s| {
                 let clean_files: &[String] = &clean_files;
                 let href_set: &FxHashSet<String> = &href_set;
                 let index = Arc::new(AtomicUsize::new(0));
@@ -725,7 +725,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
                     let index = Arc::clone(&index);
                     let cleaned = cleaned.clone();
                     let errors = errors.clone();
-                    s.spawn(move || {
+                    s.spawn(move |_| {
                         loop {
                             let i = index.fetch_add(1, Ordering::Relaxed);
                             if i >= clean_total {
@@ -876,13 +876,13 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
 
     let index = Arc::new(AtomicUsize::new(0));
 
-    std::thread::scope(|s| {
+    let _ = crossbeam::thread::scope(|s| {
         let files: &[String] = &files;
         let total_saved: &AtomicUsize = &total_saved;
         let total_original: &AtomicUsize = &total_original;
         for _ in 0..workers {
             let index = Arc::clone(&index);
-            s.spawn(move || {
+            s.spawn(move |_| {
                 loop {
                     let i = index.fetch_add(1, Ordering::Relaxed);
                     if i >= file_count {
@@ -1011,7 +1011,7 @@ fn cmd_zap(args: Args) -> Result<(), String> {
     let errors: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
     let done_counter = AtomicUsize::new(0);
 
-    std::thread::scope(|s| {
+    let _ = crossbeam::thread::scope(|s| {
         let files: &[String] = &files;
         let selector: &crate::zap::SimpleSelector = &selector;
         let errors: &std::sync::Mutex<Vec<(String, String)>> = &errors;
@@ -1021,7 +1021,7 @@ fn cmd_zap(args: Args) -> Result<(), String> {
         let index = Arc::new(AtomicUsize::new(0));
         for _ in 0..workers {
             let index = Arc::clone(&index);
-            s.spawn(move || {
+            s.spawn(move |_| {
                 loop {
                     let i = index.fetch_add(1, Ordering::Relaxed);
                     if i >= file_count {
@@ -1278,14 +1278,14 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             let unique_mu = std::sync::Mutex::new(&mut unique);
             let phase1_workers = jobs.min(files.len());
 
-            std::thread::scope(|s| {
+            let _ = crossbeam::thread::scope(|s| {
                 let files: &[String] = &files;
                 let counter: &AtomicUsize = &counter;
                 let unique_mu: &std::sync::Mutex<&mut FxHashSet<String>> = &unique_mu;
                 let index = Arc::new(AtomicUsize::new(0));
                 for _ in 0..phase1_workers {
                     let index = Arc::clone(&index);
-                    s.spawn(move || {
+                    s.spawn(move |_| {
                         loop {
                             let i = index.fetch_add(1, Ordering::Relaxed);
                             if i >= file_total {
@@ -1336,7 +1336,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             std::sync::Mutex::new(Vec::new());
         let phase1b_workers = jobs.min(unique_images.len());
 
-        std::thread::scope(|s| {
+        let _ = crossbeam::thread::scope(|s| {
             let unique_images: &[String] = &unique_images;
             let counter: &AtomicUsize = &counter;
             let converted_count: &AtomicUsize = &converted_count;
@@ -1348,7 +1348,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
             let index = Arc::new(AtomicUsize::new(0));
             for _ in 0..phase1b_workers {
                 let index = Arc::clone(&index);
-                s.spawn(move || {
+                s.spawn(move |_| {
                     loop {
                         let i = index.fetch_add(1, Ordering::Relaxed);
                         if i >= convert_total {
@@ -1519,7 +1519,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
     let phase2_file_count = files.len();
     let phase2_workers = jobs.min(files.len());
 
-    std::thread::scope(|s| {
+    let _ = crossbeam::thread::scope(|s| {
         let files: &[String] = &files;
         let converted: &FxHashSet<String> = &converted;
         let total_matches: &AtomicUsize = &total_matches;
@@ -1530,7 +1530,7 @@ fn cmd_towebp(args: Args) -> Result<(), String> {
         let index = Arc::new(AtomicUsize::new(0));
         for _ in 0..phase2_workers {
             let index = Arc::clone(&index);
-            s.spawn(move || {
+            s.spawn(move |_| {
                 loop {
                     let i = index.fetch_add(1, Ordering::Relaxed);
                     if i >= phase2_file_count {

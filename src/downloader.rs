@@ -112,7 +112,7 @@ pub fn download_and_rewrite(
 
     // Phase 1: download all unique URLs in parallel.
     if download_total > 0 {
-        std::thread::scope(|s| {
+        let _ = crossbeam::thread::scope(|s| {
             let to_download: &[String] = &to_download;
             let status: &Mutex<FxHashMap<String, UrlStatus>> = &status;
             let counter: &AtomicUsize = &counter;
@@ -136,7 +136,7 @@ pub fn download_and_rewrite(
                     cfg.referer.to_string()
                 })
                 .into();
-                s.spawn(move || {
+                s.spawn(move |_| {
                     loop {
                         let i = index.fetch_add(1, Ordering::Relaxed);
                         if i >= download_total {
@@ -190,7 +190,7 @@ pub fn download_and_rewrite(
         file_urls.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     if !file_list.is_empty() {
-        std::thread::scope(|s| {
+        let _ = crossbeam::thread::scope(|s| {
             let status: &Mutex<FxHashMap<String, UrlStatus>> = &status;
             let rewritten: &Mutex<FxHashSet<String>> = &rewritten;
             let broken_urls: &Mutex<FxHashSet<String>> = &broken_urls;
@@ -200,7 +200,7 @@ pub fn download_and_rewrite(
 
             for _ in 0..workers.min(file_count) {
                 let index = Arc::clone(&index);
-                s.spawn(move || {
+                s.spawn(move |_| {
                     loop {
                         let i = index.fetch_add(1, Ordering::Relaxed);
                         if i >= file_count {

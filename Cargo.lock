@@ -664,6 +664,7 @@ name = "localize"
 version = "0.1.0"
 dependencies = [
  "apple-translate-rs-sync",
+ "crossbeam",
  "glob",
  "html5gum",
  "jwalk",
