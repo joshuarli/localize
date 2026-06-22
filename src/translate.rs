@@ -5,7 +5,7 @@
 
 use html5gum::Tokenizer;
 use html5gum::emitters::default::DefaultEmitter;
-use macos_translate::{LanguageTranslator, TranslationError, TranslationRequest};
+use apple_translate_rs_sync::{LanguageTranslator, TranslationError, TranslationRequest};
 use std::ops::Range;
 use std::path::Path;
 
@@ -712,7 +712,7 @@ pub fn process_file(
             .map(|s| split_ws(&s.text).1)
             .collect::<Vec<&str>>()
             .join(" ");
-        match macos_translate::detect_language(&combined) {
+        match apple_translate_rs_sync::detect_language(&combined) {
             Some(lang) => lang,
             None => {
                 return Err(format!(
@@ -737,14 +737,6 @@ pub fn process_file(
             return Err(format!(
                 "{}: language pair {source} → {target} is not supported by \
                  Apple's on-device Translation framework",
-                path.display()
-            ));
-        }
-        Err(TranslationError::NoConcurrencyRuntime) => {
-            return Err(format!(
-                "{}: Swift Concurrency runtime unavailable — this tool must \
-                 run from a process with a main RunLoop (e.g. Terminal.app, \
-                 not a background daemon)",
                 path.display()
             ));
         }

@@ -25,9 +25,7 @@ pub fn asset_path(url: &str, assets_dir: &str) -> String {
         .and_then(|mut s| s.next_back())
         .filter(|b| !b.is_empty())
         .unwrap_or("index");
-    let mut hasher = XxHash64::with_seed(0);
-    hasher.write(url.as_bytes());
-    let hash = hasher.finish();
+    let hash = xxh3_64(url.as_bytes());
     let hash_hex = format!("{hash:016x}");
     let shard = &hash_hex[..2];
     let prefix = &hash_hex[..8];

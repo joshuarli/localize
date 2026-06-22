@@ -18,7 +18,7 @@ zenwebp = "0.4.4"
 png = "0.18.1"
 zune-jpeg = "0.5.15"
 memmap2 = "0.9"
-macos-translate = { path = "../translate" }
+apple-translate-rs-sync = { git = "https://github.com/joshuarli/apple-translate-rs-sync.git" }
 minify-html = { git = "https://github.com/joshuarli/minify-html.git", default-features = false }
 
 [features]

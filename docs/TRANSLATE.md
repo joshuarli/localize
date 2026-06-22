@@ -137,7 +137,7 @@ This is the same pattern used by `rewriter::zap_html`.
 ## Language detection
 
 When `--from` is omitted, all extracted text (trimmed cores) is concatenated
-and passed to `macos_translate::detect_language()`, which uses Apple's
+and passed to `apple_translate_rs_sync::detect_language()`, which uses Apple's
 `NLLanguageRecognizer`. Detection runs once per file so short files get the
 benefit of all their text combined.
 

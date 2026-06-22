@@ -37,6 +37,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "apple-translate-rs-sync"
+version = "0.0.1"
+source = "git+https://github.com/joshuarli/apple-translate-rs-sync.git#1b5ed8955b1a3eb5778859a217fe7c7cedce69af"
+dependencies = [
+ "swift-bridge",
+ "swift-bridge-build",
+]
+
+[[package]]
 name = "archmage"
 version = "0.9.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,12 +663,12 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 name = "localize"
 version = "0.1.0"
 dependencies = [
+ "apple-translate-rs-sync",
  "glob",
  "html5gum",
  "jwalk",
  "lexopt",
  "lol_html",
- "macos-translate",
  "memmap2",
  "minify-html",
  "png",
@@ -696,15 +705,6 @@ dependencies = [
  "precomputed-hash",
  "selectors",
  "thiserror",
-]
-
-[[package]]
-name = "macos-translate"
-version = "0.1.0"
-dependencies = [
- "swift-bridge",
- "swift-bridge-build",
- "tokio",
 ]
 
 [[package]]
@@ -929,12 +929,6 @@ checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
 ]
-
-[[package]]
-name = "pin-project-lite"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkg-config"
@@ -1342,27 +1336,6 @@ checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
  "zerovec",
-]
-
-[[package]]
-name = "tokio"
-version = "1.52.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
-dependencies = [
- "pin-project-lite",
- "tokio-macros",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
