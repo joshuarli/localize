@@ -34,7 +34,7 @@ struct Args {
     apply: bool,
     quiet: bool,
     // extract-css
-    css_dir: String,
+    dir: String,
 }
 
 impl Default for Args {
@@ -61,7 +61,7 @@ impl Default for Args {
             to_lang: "en".into(),
             apply: false,
             quiet: false,
-            css_dir: "assets/css".into(),
+            dir: "localized-css".into(),
         }
     }
 }
@@ -125,7 +125,7 @@ Minify-html flags:
 
 Extract-css flags:
   --apply               Apply extraction (dry-run by default).
-  --css-dir <dir>       Output directory for CSS files [default: assets/css].
+  -d, --dir <dir>       Output directory for CSS files [default: localized-css].
 
 Translate flags:
   --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
@@ -246,8 +246,8 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("quiet") | Short('q') => {
                 args.quiet = true;
             }
-            Long("css-dir") => {
-                args.css_dir = parser.value()?.string()?;
+            Short('d') | Long("dir") => {
+                args.dir = parser.value()?.string()?;
             }
             Long("from") => {
                 args.from_lang = Some(parser.value()?.string()?);
@@ -967,7 +967,7 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
     let root = args.root.as_deref().unwrap_or(".");
     let apply = args.apply;
     let verbose = args.verbose;
-    let css_dir = &args.css_dir;
+    let dir = &args.dir;
 
     let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
     let include: &[String] = if args.include.is_empty() {
@@ -982,7 +982,7 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
     };
 
     eprintln!("Discovering HTML files in {root}...");
-    let files = iter_html_files(root, include, &args.exclude);
+    let files = collect_html_depth_first(root, include, &args.exclude);
 
     if verbose {
         eprintln!("Found {} HTML file(s) to process", files.len());
@@ -994,7 +994,7 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
 
     if apply {
         eprintln!(
-            "Extracting inline CSS from {} file(s) into {css_dir}/ with {jobs} workers...",
+            "Extracting inline CSS from {} file(s) into {dir}/ with {jobs} workers...",
             files.len()
         );
     } else {
@@ -1034,7 +1034,7 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
                     let path = root_path.join(rel);
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
 
-                    let result = match crate::extract_css::extract_css(&content, rel, css_dir) {
+                    let result = match crate::extract_css::extract_css(&content, rel, dir) {
                         Ok(r) => r,
                         Err(e) => {
                             if let Ok(mut errs) = errors_mu.lock() {
@@ -1097,17 +1097,23 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
                             modified.insert_str(0, &format!("{links}\n"));
                         }
 
-                        // Write CSS files.
-                        let css_abs_dir = root_path.join(css_dir);
-                        for (css_filename, css_content) in &result.writes {
-                            let css_path = css_abs_dir.join(css_filename);
+                        // Write CSS files (content-addressed, concurrency-safe).
+                        let css_dir = root_path.join(dir);
+                        for (hash, css_content) in &result.writes {
+                            let prefix = &hash[..2];
+                            let css_path = css_dir.join(prefix).join(format!("{hash}.css"));
                             if let Some(parent) = css_path.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
-                            if let Err(e) = std::fs::write(&css_path, css_content) {
-                                if let Ok(mut errs) = errors_mu.lock() {
-                                    errs.push((rel.clone(), format!("write {css_filename}: {e}")));
-                                }
+                            // create_new is atomic (O_CREAT | O_EXCL) — if
+                            // another worker already wrote this block, or the
+                            // file exists from a prior run, skip.
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&css_path)
+                            {
+                                let _ = std::io::Write::write_all(&mut f, css_content.as_bytes());
                             }
                         }
 
@@ -1129,9 +1135,10 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
                     total_styles.fetch_add(result.writes.len(), Ordering::Relaxed);
                     total_files.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut results) = file_results.lock() {
-                        let filenames: Vec<String> =
-                            result.writes.into_iter().map(|(n, _)| n).collect();
-                        results.push((rel.clone(), filenames));
+                        let paths: Vec<String> = result.writes.iter().map(|(hash, _)| {
+                            format!("{dir}/{}/{hash}.css", &hash[..2])
+                        }).collect();
+                        results.push((rel.clone(), paths));
                     }
 
                     let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1160,20 +1167,20 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
     file_results.sort_by(|a, b| a.0.cmp(&b.0));
     let total_styles = total_styles.load(Ordering::Relaxed);
     let total_files = total_files.load(Ordering::Relaxed);
-    for (rel, filenames) in &file_results {
-        if filenames.is_empty() {
+    for (rel, paths) in &file_results {
+        if paths.is_empty() {
             continue;
         }
         println!("./{rel}");
-        for f in filenames {
-            println!("  → {css_dir}/{f}");
+        for p in paths {
+            println!("  → {p}");
         }
         println!();
     }
 
     if apply {
         eprintln!(
-            "Extracted {} inline style(s) from {} file(s) into {css_dir}/.",
+            "Extracted {} inline style(s) from {} file(s) into {dir}/.",
             total_styles, total_files
         );
     } else {
@@ -1184,6 +1191,65 @@ fn cmd_extract_css(args: Args) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Depth-first HTML file collector. Groups sibling files together so workers
+/// processing adjacent entries encounter the same CSS blocks close in time,
+/// reducing the window for duplicate writes.
+fn collect_html_depth_first(
+    root: &str,
+    include: &[String],
+    exclude: &[String],
+) -> Vec<String> {
+    let include_pats: Vec<glob::Pattern> = include
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    let exclude_pats: Vec<glob::Pattern> = exclude
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    let mut files = Vec::new();
+    walk_depth_first(
+        std::path::Path::new(root),
+        root,
+        &include_pats,
+        &exclude_pats,
+        &mut files,
+    );
+    files
+}
+
+fn walk_depth_first(
+    dir: &std::path::Path,
+    root: &str,
+    include: &[glob::Pattern],
+    exclude: &[glob::Pattern],
+    files: &mut Vec<String>,
+) {
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(iter) => iter.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for entry in &entries {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            walk_depth_first(&path, root, include, exclude, files);
+        } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && include.iter().any(|p| p.matches(&rel))
+            && !exclude.iter().any(|p| p.matches(&rel))
+        {
+            files.push(rel);
+        }
+    }
 }
 
 fn cmd_zap(args: Args) -> Result<(), String> {
