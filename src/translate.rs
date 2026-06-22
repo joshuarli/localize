@@ -659,6 +659,21 @@ fn escape_html_text(s: &str) -> String {
     out
 }
 
+/// Escape for insertion into a double-quoted HTML attribute value.
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// CSS snippet injected into each translated page. Uses a hidden checkbox at
 /// the top of `<body>` and the `:has()` selector so clicking any translated
 /// element toggles all of them between translation and original globally.
@@ -702,6 +717,18 @@ fn apply_translations(html: &str, segments: &[TextSegment]) -> String {
 
             // `translated` is prefix + translated_core + suffix; extract the core.
             let translated_core = &translated[prefix.len()..translated.len() - suffix.len()];
+
+            // AltText segments live inside HTML attributes (alt="…", title="…").
+            // Wrapping them in HTML tags would produce broken markup, so just
+            // replace the value text directly.
+            let is_attr = matches!(seg.kind, SegmentKind::AltText);
+            // <title> content must be plain text — tags inside are not rendered.
+            let is_title = seg.tag.as_str() == "title";
+
+            if is_attr || is_title {
+                let escaped = escape_html_attr(translated_core);
+                return Some((seg.span.clone(), format!("{prefix}{escaped}{suffix}")));
+            }
 
             // Use <label> so clicking toggles the global checkbox via :has().
             // Fall back to <span> inside links/buttons to avoid double-interaction.
@@ -1127,5 +1154,38 @@ mod tests {
         assert!(result.contains(r#"<span class="localized-original" aria-hidden="true">Hello &amp; welcome</span>"#));
         // Translated text is HTML-escaped (the & in the translation gets double-escaped)
         assert!(result.contains("Bonjour &amp;amp; bienvenue"));
+    }
+
+    #[test]
+    fn test_escape_html_attr() {
+        assert_eq!(escape_html_attr("hello"), "hello");
+        assert_eq!(escape_html_attr(r#"a "quoted" value"#), "a &quot;quoted&quot; value");
+        assert_eq!(escape_html_attr("a & b"), "a &amp; b");
+        assert_eq!(escape_html_attr("<x>"), "&lt;x&gt;");
+    }
+
+    #[test]
+    fn test_apply_translations_alt_text_no_wrapper() {
+        let html = r#"<img src="x.jpg" alt="A nice photo">"#;
+        let mut segs = extract_segments(html);
+        assert!(matches!(segs[0].kind, SegmentKind::AltText));
+        segs[0].translated = Some("Une belle photo".into());
+        let result = apply_translations(html, &segs);
+        // Alt attribute value replaced directly — no wrapper spans
+        assert!(!result.contains("localized-translated-text"));
+        assert!(!result.contains("<label"));
+        assert!(result.contains(r#"alt="Une belle photo""#));
+    }
+
+    #[test]
+    fn test_apply_translations_title_no_wrapper() {
+        let html = "<title>My Page</title>";
+        let mut segs = extract_segments(html);
+        assert_eq!(segs[0].tag, "title");
+        segs[0].translated = Some("Ma Page".into());
+        let result = apply_translations(html, &segs);
+        // <title> content replaced directly — no wrapper spans
+        assert!(!result.contains("localized-translated-text"));
+        assert_eq!(result, "<title>Ma Page</title>");
     }
 }
