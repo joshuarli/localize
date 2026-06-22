@@ -38,9 +38,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "apple-translate-rs-sync"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f645fdb0a05e79cd591f5df03611e1d1cfaa786367a2241704d4d01c6002dd5"
+checksum = "515999e5c249de756caae9ab2638a26514ecee9d1a7ac4770bb4fb0246093387"
 dependencies = [
  "swift-bridge",
  "swift-bridge-build",
