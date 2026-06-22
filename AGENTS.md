@@ -62,7 +62,7 @@ Key design decisions for scan performance (~880ms on a 9777-file site, 2365 HTML
 - **Hashing**: `twox-hash` (xxhash64) for content-addressed asset paths.
 - **CLI**: `lexopt` for argument parsing.
 - **File walking**: `jwalk` (parallel, for scan discovery) + `walkdir` (for other commands) + `glob` for pattern filtering.
-- **Hashing**: `twox-hash` (xxhash64 for content-addressed asset paths) + `rustc-hash` for `FxHashMap`/`FxHashSet`.
+- **Hashing**: `xxhash-rust` (XXH3-64 for content-addressed asset paths) + `rustc-hash` for `FxHashMap`/`FxHashSet`.
 - **Concurrency**: `std::thread::scope` + `Arc<AtomicUsize>` work-stealing for all parallel work. Download-rewrite pipelining replaced with two-phase (download all → rewrite all).
 - **URL parsing**: `url` crate for origin extraction and path handling.
 - **Image codecs**: `png` (PNG decoding), `zune-jpeg` (JPEG decoding), `zenwebp` (pure-Rust WebP encoding, quality 90).

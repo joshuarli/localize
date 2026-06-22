@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 html5gum = "0.8"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
-twox-hash = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 lexopt = "0.3"
 url = "2"
 glob = "0.3"

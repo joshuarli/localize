@@ -1,5 +1,4 @@
-use std::hash::Hasher;
-use twox_hash::XxHash64;
+use xxhash_rust::xxh3::xxh3_64;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Write;
 use std::path::Path;
@@ -15,9 +14,7 @@ pub fn asset_path(url: &str, assets_dir: &str) -> String {
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
         Err(_) => {
-            let mut hasher = XxHash64::with_seed(0);
-            hasher.write(url.as_bytes());
-            let hash = hasher.finish();
+            let hash = xxh3_64(url.as_bytes());
             let hash_hex = format!("{hash:016x}");
             return format!("{assets_dir}/unparsable/{hash_hex}-file");
         }
