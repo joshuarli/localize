@@ -33,6 +33,8 @@ struct Args {
     to_lang: String,
     apply: bool,
     quiet: bool,
+    // extract-css
+    css_dir: String,
 }
 
 impl Default for Args {
@@ -59,6 +61,7 @@ impl Default for Args {
             to_lang: "en".into(),
             apply: false,
             quiet: false,
+            css_dir: "assets/css".into(),
         }
     }
 }
@@ -75,6 +78,9 @@ Commands:
                 With --download, fetch remote assets and rewrite HTML to use
                 local paths.  With --clean, fix broken local links by
                 unwrapping dead <a> tags and removing dead resource elements.
+  extract-css   Extract inline <style> CSS blocks into separate .css files
+                and replace them with <link rel=\"stylesheet\"> tags in <head>.
+                Dry-run by default, --apply to write.
   minify-html   Minify HTML files: strip whitespace, remove comments,
                 collapse redundant attributes, omit optional tags. Dry-run
                 by default, --apply to write.
@@ -117,6 +123,10 @@ Minify-html flags:
   --apply               Apply minification (dry-run by default).
   --quiet, -q           Suppress per-file savings output.
 
+Extract-css flags:
+  --apply               Apply extraction (dry-run by default).
+  --css-dir <dir>       Output directory for CSS files [default: assets/css].
+
 Translate flags:
   --from <lang>         Source language (BCP-47, e.g. zh-Hans). Auto-detect
                         per file if omitted.
@@ -130,6 +140,7 @@ Examples:
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply
   localize minify-html ~/mysite --apply
+  localize extract-css ~/mysite --apply
   localize translate ~/mysite --to en --apply"
     );
 }
@@ -234,6 +245,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("quiet") | Short('q') => {
                 args.quiet = true;
+            }
+            Long("css-dir") => {
+                args.css_dir = parser.value()?.string()?;
             }
             Long("from") => {
                 args.from_lang = Some(parser.value()?.string()?);
@@ -943,6 +957,229 @@ fn cmd_minify_html(args: Args) -> Result<(), String> {
         eprintln!(
             "Dry-run: {} file(s) would save {} bytes ({total_pct:.1}%). Run with --apply to minify.",
             file_count, total_saved
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_extract_css(args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+    let apply = args.apply;
+    let verbose = args.verbose;
+    let css_dir = &args.css_dir;
+
+    let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
+    let include: &[String] = if args.include.is_empty() {
+        &default_include
+    } else {
+        &args.include
+    };
+    let jobs = if args.jobs == 0 {
+        num_cpus() * 4
+    } else {
+        args.jobs
+    };
+
+    eprintln!("Discovering HTML files in {root}...");
+    let files = iter_html_files(root, include, &args.exclude);
+
+    if verbose {
+        eprintln!("Found {} HTML file(s) to process", files.len());
+    }
+    if files.is_empty() {
+        eprintln!("No HTML files found.");
+        return Ok(());
+    }
+
+    if apply {
+        eprintln!(
+            "Extracting inline CSS from {} file(s) into {css_dir}/ with {jobs} workers...",
+            files.len()
+        );
+    } else {
+        eprintln!(
+            "Dry-run: scanning {} file(s) for inline CSS with {jobs} workers...",
+            files.len()
+        );
+    }
+
+    let root_path = std::path::Path::new(root);
+    let file_count = files.len();
+    let workers = jobs.min(files.len());
+
+    let total_styles = AtomicUsize::new(0);
+    let total_files = AtomicUsize::new(0);
+    let errors_mu = std::sync::Mutex::new(Vec::new());
+    let file_results = std::sync::Mutex::new(Vec::new());
+    let done_counter = AtomicUsize::new(0);
+
+    let _ = crossbeam::thread::scope(|s| {
+        let files: &[String] = &files;
+        let errors_mu: &std::sync::Mutex<Vec<(String, String)>> = &errors_mu;
+        let file_results: &std::sync::Mutex<Vec<(String, Vec<String>)>> = &file_results;
+        let total_styles: &AtomicUsize = &total_styles;
+        let total_files: &AtomicUsize = &total_files;
+        let done_counter: &AtomicUsize = &done_counter;
+        let index = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let index = Arc::clone(&index);
+            s.spawn(move |_| {
+                loop {
+                    let i = index.fetch_add(1, Ordering::Relaxed);
+                    if i >= file_count {
+                        break;
+                    }
+                    let rel = &files[i];
+                    let path = root_path.join(rel);
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+                    let result = match crate::extract_css::extract_css(&content, rel, css_dir) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if let Ok(mut errs) = errors_mu.lock() {
+                                errs.push((rel.clone(), e));
+                            }
+                            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if !verbose && done.is_multiple_of(16) {
+                                eprint!("\rProcessing: {done}/{file_count} files");
+                                let _ = std::io::stderr().flush();
+                            }
+                            continue;
+                        }
+                    };
+
+                    if result.writes.is_empty() {
+                        let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !verbose && done.is_multiple_of(16) {
+                            eprint!("\rProcessing: {done}/{file_count} files");
+                            let _ = std::io::stderr().flush();
+                        }
+                        continue;
+                    }
+
+                    if apply {
+                        // Delete <style> blocks (reverse span order, like zap).
+                        let mut modified = content;
+                        let mut spans: Vec<std::ops::Range<usize>> =
+                            result.spans_to_delete.iter().cloned().collect();
+                        spans.sort_by_key(|s| std::cmp::Reverse(s.start));
+                        for span in &spans {
+                            modified.replace_range(span.clone(), "");
+                        }
+
+                        // Insert <link> tags before </head>.
+                        // Minified HTML may omit </head> (HTML5-optional).
+                        // Fall back to before <body, then after <html>, then
+                        // position 0.
+                        let links = result.link_tags.join("\n");
+                        let anchor = modified.find("</head>").or_else(|| {
+                            modified.match_indices("</head").find_map(|(i, _)| {
+                                let after = &modified[i + 6..];
+                                if after.is_empty() {
+                                    return Some(i);
+                                }
+                                if after.as_bytes()[0].is_ascii_alphabetic() {
+                                    None // skip </header>, </headings, etc.
+                                } else {
+                                    Some(i)
+                                }
+                            })
+                        });
+                        if let Some(pos) = anchor {
+                            modified.insert_str(pos, &format!("\n{links}\n"));
+                        } else if let Some(pos) = modified.find("<body") {
+                            modified.insert_str(pos, &format!("{links}\n"));
+                        } else if let Some(pos) = modified.find("<html") {
+                            let close = modified[pos..].find('>').map(|e| pos + e + 1).unwrap_or(pos);
+                            modified.insert_str(close, &format!("\n{links}\n"));
+                        } else {
+                            modified.insert_str(0, &format!("{links}\n"));
+                        }
+
+                        // Write CSS files.
+                        let css_abs_dir = root_path.join(css_dir);
+                        for (css_filename, css_content) in &result.writes {
+                            let css_path = css_abs_dir.join(css_filename);
+                            if let Some(parent) = css_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if let Err(e) = std::fs::write(&css_path, css_content) {
+                                if let Ok(mut errs) = errors_mu.lock() {
+                                    errs.push((rel.clone(), format!("write {css_filename}: {e}")));
+                                }
+                            }
+                        }
+
+                        // Write modified HTML via tmp+rename.
+                        let tmp = path.with_extension("tmp");
+                        if let Err(e) = std::fs::write(&tmp, &modified)
+                            .map_err(|e| format!("write tmp: {e}"))
+                            .and_then(|_| {
+                                std::fs::rename(&tmp, &path)
+                                    .map_err(|e| format!("rename: {e}"))
+                            })
+                        {
+                            if let Ok(mut errs) = errors_mu.lock() {
+                                errs.push((rel.clone(), format!("{}: {e}", path.display())));
+                            }
+                        }
+                    }
+
+                    total_styles.fetch_add(result.writes.len(), Ordering::Relaxed);
+                    total_files.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut results) = file_results.lock() {
+                        let filenames: Vec<String> =
+                            result.writes.into_iter().map(|(n, _)| n).collect();
+                        results.push((rel.clone(), filenames));
+                    }
+
+                    let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !verbose && done.is_multiple_of(16) {
+                        eprint!("\rProcessing: {done}/{file_count} files");
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            });
+        }
+    });
+
+    if !verbose && !files.is_empty() {
+        eprintln!();
+    }
+
+    let errors = errors_mu.into_inner().unwrap();
+    if !errors.is_empty() {
+        eprintln!("Errors:");
+        for (rel, err) in &errors {
+            eprintln!("  {rel}: {err}");
+        }
+    }
+
+    let mut file_results = file_results.into_inner().unwrap();
+    file_results.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_styles = total_styles.load(Ordering::Relaxed);
+    let total_files = total_files.load(Ordering::Relaxed);
+    for (rel, filenames) in &file_results {
+        if filenames.is_empty() {
+            continue;
+        }
+        println!("./{rel}");
+        for f in filenames {
+            println!("  → {css_dir}/{f}");
+        }
+        println!();
+    }
+
+    if apply {
+        eprintln!(
+            "Extracted {} inline style(s) from {} file(s) into {css_dir}/.",
+            total_styles, total_files
+        );
+    } else {
+        eprintln!(
+            "Dry-run: found {} inline style(s) in {} file(s). Run with --apply to extract.",
+            total_styles, total_files
         );
     }
 
@@ -1797,7 +2034,7 @@ pub fn run() -> i32 {
         Ok(a) => a,
         Err(e) => {
             eprintln!("localize: {e}");
-            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
@@ -1805,19 +2042,20 @@ pub fn run() -> i32 {
 
     let result = match args.command.as_deref() {
         Some("check") => cmd_check(args),
+        Some("extract-css") => cmd_extract_css(args),
         Some("minify-html") => cmd_minify_html(args),
         Some("zap") => cmd_zap(args),
         Some("towebp") => cmd_towebp(args),
         Some("translate") => cmd_translate(args),
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
-            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
+            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }
         None => {
-            eprintln!("localize: expected subcommand (check, zap, towebp, or translate)");
-            eprintln!("Usage: localize <check|minify-html|zap|towebp|translate> [ROOT] [flags]");
+            eprintln!("localize: expected subcommand (check, extract-css, minify-html, towebp, translate, or zap)");
+            eprintln!("Usage: localize <check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]");
             eprintln!("Try 'localize --help' for more information.");
             return 1;
         }

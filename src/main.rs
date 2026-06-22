@@ -2,6 +2,7 @@ mod alloc;
 mod clean;
 mod cli;
 mod downloader;
+mod extract_css;
 mod rewriter;
 mod scanner;
 mod towebp;
