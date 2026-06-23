@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct Args {
     command: Option<String>,
     root: Option<String>,
+    files: Vec<String>,
     include: Vec<String>,
     exclude: Vec<String>,
     assets_dir: String,
@@ -46,6 +47,7 @@ impl Default for Args {
         Self {
             command: None,
             root: None,
+            files: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
             assets_dir: "assets/external".into(),
@@ -84,6 +86,7 @@ Commands:
                 With --download, fetch remote assets and rewrite HTML to use
                 local paths.  With --clean, fix broken local links by
                 unwrapping dead <a> tags and removing dead resource elements.
+                Usage: localize check [ROOT] [FILES...] [flags]
   bundle-css    Bundle all <link rel=\"stylesheet\"> CSS files across the site
                 into a single monolithic content-addressed .css file, then
                 rewrite every HTML file to reference the single bundle.
@@ -152,6 +155,8 @@ Examples:
   localize check ~/mysite
   localize check ~/mysite --download
   localize check ~/mysite --clean
+  localize check ~/mysite about.html contact.html
+  localize check about.html contact.html --verbose
   localize zap p \"Copyright 2019\" ~/mysite --apply
   localize towebp ~/mysite --apply
   localize minify-html ~/mysite --apply
@@ -283,14 +288,18 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 print_help();
                 std::process::exit(0);
             }
-            // A bare value after known positionals is the root directory.
+            // First bare value after known positionals is the root directory.
             Value(val) if args.root.is_none() => {
                 args.root = Some(val.string()?);
+            }
+            // Subsequent bare values are file paths.
+            Value(val) => {
+                args.files.push(val.string()?);
             }
             Long(unknown) => {
                 return Err(format!("unknown flag --{unknown}").into());
             }
-            Short(_) | Value(_) => {
+            Short(_) => {
                 return Err("unexpected argument".into());
             }
         }
@@ -611,8 +620,22 @@ fn dedup_broken(refs: &[MediaReference]) -> Vec<MediaReference> {
     out
 }
 
-fn cmd_check(args: Args) -> Result<(), String> {
-    let root = args.root.as_ref().ok_or("missing root")?;
+fn cmd_check(mut args: Args) -> Result<(), String> {
+    let root = args.root.as_deref().unwrap_or(".");
+
+    // When the user passes a file path as the first positional (instead of a
+    // directory), infer root as $PWD and treat the positional as a file.
+    if root != "."
+        && !Path::new(root).is_dir()
+    {
+        let p = Path::new(root);
+        if p.is_file() || root.ends_with(".html") || root.ends_with(".htm") {
+            args.files.insert(0, root.to_string());
+            args.root = Some(".".into());
+        }
+    }
+
+    let root = args.root.as_deref().unwrap_or(".");
     let default_include = vec!["*.html".to_string(), "*.htm".to_string()];
     let include: &[String] = if args.include.is_empty() {
         &default_include
@@ -625,23 +648,36 @@ fn cmd_check(args: Args) -> Result<(), String> {
         args.jobs
     };
 
+    // Always walk the full tree to build href_set for broken-link detection,
+    // even when scanning only explicit files.
     eprintln!("Discovering files in {root}...");
-    let (files, href_set) = discover_and_index(root, include, &args.exclude);
-
+    let (all_files, href_set) = discover_and_index(root, include, &args.exclude);
     if args.verbose {
         eprintln!(
             "Found {} HTML file(s), {} total file(s)",
-            files.len(),
+            all_files.len(),
             href_set.len()
         );
     }
-    if files.is_empty() {
+
+    let scan_files: Vec<String> = if !args.files.is_empty() {
+        eprintln!("Scanning {} explicit file(s) with {jobs} workers...", args.files.len());
+        args.files.clone()
+    } else {
+        if all_files.is_empty() {
+            eprintln!("No HTML files found.");
+            return Ok(());
+        }
+        eprintln!("Scanning {} file(s) with {jobs} workers...", all_files.len());
+        all_files
+    };
+
+    if scan_files.is_empty() {
         eprintln!("No HTML files found.");
         return Ok(());
     }
 
-    eprintln!("Scanning {} file(s) with {jobs} workers...", files.len());
-    let refs = scan_all(root, &files, jobs, args.verbose, &href_set);
+    let refs = scan_all(root, &scan_files, jobs, args.verbose, &href_set);
     let deduped = dedup_broken(&refs);
 
     if args.download {
@@ -854,7 +890,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
             "Dry-run: {} broken-local-url, {} remote-url in {} file(s).",
             broken_urls.len(),
             remote_urls.len(),
-            files.len()
+            scan_files.len()
         );
     }
 
@@ -871,7 +907,7 @@ fn cmd_check(args: Args) -> Result<(), String> {
         eprintln!(
             "\nTotal: {} reference(s) in {} file(s) ({} unique broken-local-url, {} unique remote-url)",
             refs.len(),
-            files.len(),
+            scan_files.len(),
             broken_urls.len(),
             remote_urls.len(),
         );
@@ -2482,7 +2518,7 @@ pub fn run() -> i32 {
         Err(e) => {
             eprintln!("localize: {e}");
             eprintln!(
-                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [FILES...] [flags]"
             );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
@@ -2500,7 +2536,7 @@ pub fn run() -> i32 {
         Some(cmd) => {
             eprintln!("localize: unknown command '{cmd}'");
             eprintln!(
-                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [FILES...] [flags]"
             );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
@@ -2510,7 +2546,7 @@ pub fn run() -> i32 {
                 "localize: expected subcommand (check, extract-css, minify-html, towebp, translate, or zap)"
             );
             eprintln!(
-                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [flags]"
+                "Usage: localize <bundle-css|check|extract-css|minify-html|towebp|translate|zap> [ROOT] [FILES...] [flags]"
             );
             eprintln!("Try 'localize --help' for more information.");
             return 1;
