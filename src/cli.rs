@@ -231,7 +231,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("json") => {
                 args.json = true;
             }
-            Long("verbose") => {
+            Long("verbose") | Short('v') => {
                 args.verbose = true;
             }
             Long("jobs") => {
@@ -470,7 +470,9 @@ fn scan_all(
     all_refs
 }
 
-fn print_human(refs: &[MediaReference]) {
+fn print_human(refs: &[MediaReference], verbose: bool) {
+    let mut groups: FxHashMap<(String, String), Vec<&MediaReference>> = FxHashMap::default();
+
     for r in refs {
         if !is_remote_url(&r.url) && !r.broken {
             continue;
@@ -480,13 +482,35 @@ fn print_human(refs: &[MediaReference]) {
         } else {
             "remote-url"
         };
-        if let Some(ref desc) = r.descriptor {
-            println!(
-                "{kind}: ./{}:{}:{}  {}  {desc}",
-                r.file_path, r.line, r.col, r.url
-            );
+        let key = if r.broken {
+            resolve_relative(&r.file_path, &r.url)
         } else {
-            println!("{kind}: ./{}:{}:{}  {}", r.file_path, r.line, r.col, r.url);
+            r.url.to_string()
+        };
+        groups
+            .entry((kind.to_string(), key))
+            .or_default()
+            .push(r);
+    }
+
+    let mut keys: Vec<&(String, String)> = groups.keys().collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    for key in keys {
+        let refs = &groups[key];
+        let (kind, url) = key;
+        println!("{kind}: {url}");
+        if verbose {
+            for r in refs.iter() {
+                if let Some(ref desc) = r.descriptor {
+                    println!("    ./{}:{}:{}  {desc}", r.file_path, r.line, r.col);
+                } else {
+                    println!("    ./{}:{}:{}", r.file_path, r.line, r.col);
+                }
+            }
+        } else {
+            let n = refs.len();
+            println!("    ({n} reference{})", if n == 1 { "" } else { "s" });
         }
     }
 }
@@ -815,32 +839,41 @@ fn cmd_check(args: Args) -> Result<(), String> {
         if args.json {
             print_json(&deduped);
         } else {
-            print_human(&deduped);
+            print_human(&refs, args.verbose);
         }
-        let broken = deduped.iter().filter(|r| r.broken).count();
-        let remote = deduped.len() - broken;
+        let mut broken_urls: FxHashSet<String> = FxHashSet::default();
+        let mut remote_urls: FxHashSet<&str> = FxHashSet::default();
+        for r in &refs {
+            if r.broken {
+                broken_urls.insert(resolve_relative(&r.file_path, &r.url));
+            } else if is_remote_url(&r.url) {
+                remote_urls.insert(&r.url);
+            }
+        }
         eprintln!(
             "Dry-run: {} broken-local-url, {} remote-url in {} file(s).",
-            broken,
-            remote,
+            broken_urls.len(),
+            remote_urls.len(),
             files.len()
         );
     }
 
     if args.verbose {
-        let total_refs: &[MediaReference] = if args.download || args.clean {
-            &refs
-        } else {
-            &deduped
-        };
-        let unique_broken = total_refs.iter().filter(|r| r.broken).count();
-        let remote = total_refs.len() - unique_broken;
+        let mut broken_urls: FxHashSet<String> = FxHashSet::default();
+        let mut remote_urls: FxHashSet<&str> = FxHashSet::default();
+        for r in &refs {
+            if r.broken {
+                broken_urls.insert(resolve_relative(&r.file_path, &r.url));
+            } else if is_remote_url(&r.url) {
+                remote_urls.insert(&r.url);
+            }
+        }
         eprintln!(
-            "\nTotal: {} reference(s) in {} file(s) ({} unique local broken, {} remote)",
-            total_refs.len(),
+            "\nTotal: {} reference(s) in {} file(s) ({} unique broken-local-url, {} unique remote-url)",
+            refs.len(),
             files.len(),
-            unique_broken,
-            remote,
+            broken_urls.len(),
+            remote_urls.len(),
         );
     }
 

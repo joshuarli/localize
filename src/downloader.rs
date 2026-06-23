@@ -108,7 +108,18 @@ pub fn download_and_rewrite(
     let workers = cfg.jobs.max(1);
 
     // Build a shared ureq agent with connection pooling.
-    let agent: Arc<ureq::Agent> = ureq::Agent::new_with_defaults().into();
+    let timeout = Duration::from_secs(cfg.timeout.into());
+    let agent: Arc<ureq::Agent> = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .timeout_connect(Some(timeout))
+        .timeout_recv_body(Some(timeout))
+        .build()
+        .new_agent()
+        .into();
 
     // Phase 1: download all unique URLs in parallel.
     if download_total > 0 {
@@ -123,7 +134,6 @@ pub fn download_and_rewrite(
                 cfg.user_agent
             })
             .into();
-            let timeout = Duration::from_secs(cfg.timeout.into());
             let retries = cfg.retries;
 
             for _ in 0..workers.min(download_total) {
@@ -150,7 +160,7 @@ pub fn download_and_rewrite(
                         };
                         let dest = cfg.root.join(asset_path(url, cfg.assets_dir));
                         let result =
-                            download_one(&agent, url, &referer, &dest, timeout, retries, &ua);
+                            download_one(&agent, url, &referer, &dest, retries, &ua);
                         let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         eprint!("\r  Downloading: {done}/{download_total}");
                         let _ = std::io::stderr().flush();
@@ -305,7 +315,6 @@ fn download_one(
     url: &str,
     referer: &str,
     dest: &Path,
-    _timeout: Duration,
     retries: u32,
     user_agent: &str,
 ) -> Result<(), (bool, String)> {
@@ -398,10 +407,17 @@ fn fetch_with_redirects(
 
         if status.is_redirection() {
             if let Some(location) = resp.headers().get("location") {
-                current_url = location
+                let loc_str = location
                     .to_str()
-                    .map_err(|_| (true, "invalid redirect location".to_string()))?
-                    .to_string();
+                    .map_err(|_| (true, "invalid redirect location".to_string()))?;
+                // Resolve relative redirect URLs against the current URL.
+                if let Ok(base) = url::Url::parse(&current_url) {
+                    if let Ok(resolved) = base.join(loc_str) {
+                        current_url = resolved.to_string();
+                        continue;
+                    }
+                }
+                current_url = loc_str.to_string();
                 continue;
             }
             return Err((true, "redirect without Location header".into()));
